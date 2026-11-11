@@ -20,9 +20,9 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.service.SmartCastAudioService
-import org.concentus.OpusApplication
-import org.concentus.OpusDecoder
-import org.concentus.OpusEncoder
+import io.github.jaredmdobson.concentus.OpusApplication
+import io.github.jaredmdobson.concentus.OpusDecoder
+import io.github.jaredmdobson.concentus.OpusEncoder
 import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.InetSocketAddress
