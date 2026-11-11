@@ -27,4 +27,5 @@ android {
 
 dependencies {
     implementation("io.github.jaredmdobson:concentus:1.0.2")
+    implementation("com.google.zxing:core:3.5.3")
 }
