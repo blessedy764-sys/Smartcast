@@ -2,6 +2,7 @@ package com.smartcast.live
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -9,6 +10,7 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.AudioManager
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
 import android.widget.Button
@@ -17,6 +19,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
+import com.smartcast.live.service.SmartCastAudioService
 import org.concentus.OpusApplication
 import org.concentus.OpusDecoder
 import org.concentus.OpusEncoder
@@ -55,9 +58,20 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
+        requestNeededPermissions()
+    }
+
+    private fun requestNeededPermissions() {
+        val wanted = mutableListOf<String>()
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_MIC)
+            wanted += Manifest.permission.RECORD_AUDIO
         }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            wanted += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (wanted.isNotEmpty()) requestPermissions(wanted.toTypedArray(), REQUEST_MIC)
     }
 
     private fun buildUi() {
@@ -136,13 +150,26 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Keeps the app alive with the screen off (foreground service + notification). */
+    private fun startAudioService(hosting: Boolean) {
+        try {
+            startForegroundService(
+                Intent(this, SmartCastAudioService::class.java)
+                    .putExtra(SmartCastAudioService.EXTRA_HOST, hosting)
+            )
+        } catch (_: Exception) {
+            // Continue without background protection rather than blocking audio.
+        }
+    }
+
     private fun startHost() {
         if (running.get()) { toast("Stop the current session first."); return }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_MIC)
+            requestNeededPermissions()
             return
         }
         running.set(true)
+        startAudioService(true)
         setState("Starting Opus broadcaster…")
         thread(name = "SmartCastOpusHost") {
             var input: AudioRecord? = null
@@ -153,32 +180,34 @@ class MainActivity : Activity() {
                     SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
                 if (minBuffer <= 0) throw IllegalStateException("AudioRecord does not support 48 kHz input on this device")
-                input = AudioRecord(
+                val mic = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_RECOGNITION,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     maxOf(minBuffer, FRAME_SAMPLES * 2 * 4)
                 )
-                if (input.state != AudioRecord.STATE_INITIALIZED) throw IllegalStateException("Microphone could not be initialized")
-                recorder = input
+                input = mic
+                if (mic.state != AudioRecord.STATE_INITIALIZED) throw IllegalStateException("Microphone could not be initialized")
+                recorder = mic
                 val encoder = OpusEncoder(SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
                 encoder.setBitrate(BITRATE)
                 encoder.setComplexity(5)
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
                 val address = InetAddress.getByName(GROUP)
-                udp = MulticastSocket()
-                udp.timeToLive = 1
-                socket = udp
-                input.startRecording()
+                val sock = MulticastSocket()
+                udp = sock
+                sock.timeToLive = 1
+                socket = sock
+                mic.startRecording()
                 setState("Broadcasting Opus audio over local Wi-Fi")
                 var sequence = 0
                 val sessionId = (System.nanoTime() xor android.os.Process.myPid().toLong()).toInt()
                 while (running.get()) {
                     var filled = 0
                     while (running.get() && filled < FRAME_SAMPLES) {
-                        val count = input.read(pcm, filled, FRAME_SAMPLES - filled, AudioRecord.READ_BLOCKING)
+                        val count = mic.read(pcm, filled, FRAME_SAMPLES - filled, AudioRecord.READ_BLOCKING)
                         if (count < 0) throw IllegalStateException("Microphone read failed: $count")
                         if (count > 0) filled += count
                     }
@@ -188,14 +217,14 @@ class MainActivity : Activity() {
                         val packetData = ByteBuffer.allocate(HEADER_SIZE + encodedLength).order(ByteOrder.BIG_ENDIAN)
                         packetData.putInt(MAGIC)
                         packetData.put(VERSION)
-                        packetData.put(0) // flags reserved
+                        packetData.put(0.toByte()) // flags reserved
                         packetData.putInt(sessionId)
                         packetData.putInt(sequence++)
                         packetData.putLong(System.nanoTime())
                         packetData.putShort(encodedLength.toShort())
                         packetData.put(encoded, 0, encodedLength)
                         val bytes = packetData.array()
-                        udp.send(DatagramPacket(bytes, bytes.size, address, PORT))
+                        sock.send(DatagramPacket(bytes, bytes.size, address, PORT))
                     }
                 }
             } catch (e: Exception) {
@@ -215,6 +244,7 @@ class MainActivity : Activity() {
     private fun startReceiver() {
         if (running.get()) { toast("Stop the current session first."); return }
         running.set(true)
+        startAudioService(false)
         setState("Searching for Opus broadcast…")
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
@@ -222,16 +252,17 @@ class MainActivity : Activity() {
             try {
                 acquireMulticastLock()
                 val groupAddress = InetAddress.getByName(GROUP)
-                udp = MulticastSocket(null)
-                udp.reuseAddress = true
-                udp.bind(InetSocketAddress(PORT))
-                udp.joinGroup(groupAddress)
-                socket = udp
+                val sock = MulticastSocket(null)
+                udp = sock
+                sock.reuseAddress = true
+                sock.bind(InetSocketAddress(PORT))
+                sock.joinGroup(groupAddress)
+                socket = sock
                 val minBuffer = AudioTrack.getMinBufferSize(
                     SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
                 if (minBuffer <= 0) throw IllegalStateException("AudioTrack does not support 48 kHz output on this device")
-                output = AudioTrack(
+                val sink = AudioTrack(
                     AudioManager.STREAM_MUSIC,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_OUT_MONO,
@@ -239,17 +270,18 @@ class MainActivity : Activity() {
                     maxOf(minBuffer, FRAME_SAMPLES * 2 * 4),
                     AudioTrack.MODE_STREAM
                 )
-                track = output
+                output = sink
+                track = sink
                 val decoder = OpusDecoder(SAMPLE_RATE, 1)
                 val pcmOut = ShortArray(5760) // Opus maximum frame: 120 ms at 48 kHz
                 val receiveBuffer = ByteArray(HEADER_SIZE + MAX_OPUS_BYTES + 64)
                 var activeSession = 0
                 var expectedSequence: Int? = null
-                output.play()
+                sink.play()
                 setState("Receiving and decoding Opus audio")
                 while (running.get()) {
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
-                    udp.receive(packet)
+                    sock.receive(packet)
                     if (packet.length < HEADER_SIZE) continue
                     val header = ByteBuffer.wrap(packet.data, packet.offset, packet.length).order(ByteOrder.BIG_ENDIAN)
                     if (header.int != MAGIC) continue
@@ -266,21 +298,19 @@ class MainActivity : Activity() {
                     }
                     val expected = expectedSequence ?: sequence
                     val gap = sequence - expected
+                    if (gap < 0) continue // late or duplicate packet
                     // Opus is stateful: conceal missing 20 ms frames before decoding the next packet.
                     if (gap in 1..5) {
-                        repeat(gap) {
+                        for (i in 1..gap) {
                             val concealed = decoder.decode(null, 0, 0, pcmOut, 0, FRAME_SAMPLES, false)
-                            if (concealed > 0) output.write(pcmOut, 0, concealed)
+                            if (concealed > 0) sink.write(pcmOut, 0, concealed)
                         }
-                    } else if (gap < 0 || gap > 5) {
-                        // Drop late/out-of-window packets; reset sequence expectation to current packet.
-                        if (gap < 0) continue
                     }
                     val decodedSamples = decoder.decode(
                         packet.data, packet.offset + HEADER_SIZE, payloadLength,
                         pcmOut, 0, pcmOut.size, false
                     )
-                    if (decodedSamples > 0) output.write(pcmOut, 0, decodedSamples)
+                    if (decodedSamples > 0) sink.write(pcmOut, 0, decodedSamples)
                     expectedSequence = sequence + 1
                 }
             } catch (e: Exception) {
@@ -304,6 +334,7 @@ class MainActivity : Activity() {
 
     private fun stopSession() {
         running.set(false)
+        try { stopService(Intent(this, SmartCastAudioService::class.java)) } catch (_: Exception) {}
         try { recorder?.stop() } catch (_: Exception) {}
         try { track?.pause(); track?.flush(); track?.stop() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
