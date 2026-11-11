@@ -1,53 +1,60 @@
-package com.gitco.smartcast.telemetry
+package com.example.smartcast.room
 
-import android.os.Handler
-import android.os.Looper
 import java.util.concurrent.ConcurrentHashMap
 
 data class ClientInfo(
-    val clientId: Long,
-    var lastSeenTimestamp: Long,
-    var packetLossPercent: Int,
-    var jitterMs: Int
+    val clientId: String,
+    val address: String,
+    val firstSeenTimestamp: Long,
+    val lastSeenTimestamp: Long
 )
 
-class ClientTracker(private val onClientListUpdated: (List<ClientInfo>) -> Unit) {
-    private val activeClients = ConcurrentHashMap<Long, ClientInfo>()
-    private val handler = Handler(Looper.getMainLooper())
-    private val cleanupRunnable = object : Runnable {
-        override fun run() {
-            val now = System.currentTimeMillis()
-            // Remove clients who haven't sent a heartbeat in 10 seconds
-            let removed = activeClients.entries.removeIf { (_, client) ->
-                now - client.lastSeenTimestamp > 10000
+class ClientTracker(
+    private val timeoutMs: Long = 5_000L
+) {
+    private val clients = ConcurrentHashMap<String, ClientInfo>()
+
+    /** Call when a heartbeat arrives. Adds the client or refreshes its last-seen time. */
+    fun onHeartbeat(
+        clientId: String,
+        address: String,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        val existing = clients[clientId]
+        val first = existing?.firstSeenTimestamp ?: nowMs
+        clients[clientId] = ClientInfo(
+            clientId = clientId,
+            address = address,
+            firstSeenTimestamp = first,
+            lastSeenTimestamp = nowMs
+        )
+    }
+
+    /** Removes clients not heard from within the timeout. Returns the removed client IDs. */
+    fun removeStale(nowMs: Long = System.currentTimeMillis()): List<String> {
+        val removed = mutableListOf<String>()
+        val iterator = clients.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (nowMs - entry.value.lastSeenTimestamp > timeoutMs) {
+                removed.add(entry.key)
+                iterator.remove()
             }
-            if (removed) {
-                onClientListUpdated(activeClients.values.toList())
-            }
-            handler.postDelayed(this, 3000) // Check every 3 seconds
         }
+        return removed
     }
 
-    fun startTracking() {
-        handler.post(cleanupRunnable)
+    fun remove(clientId: String) {
+        clients.remove(clientId)
     }
 
-    fun stopTracking() {
-        handler.removeCallbacks(cleanupRunnable)
-        activeClients.clear()
+    fun isActive(clientId: String): Boolean = clients.containsKey(clientId)
+
+    fun activeClients(): List<ClientInfo> = clients.values.toList()
+
+    fun count(): Int = clients.size
+
+    fun clear() {
+        clients.clear()
     }
-
-    fun recordHeartbeat(packet: HeartbeatPacket) {
-        val now = System.currentTimeMillis()
-        val client = activeClients.getOrPut(packet.clientId) {
-            ClientInfo(packet.clientId, now, packet.packetLossPercent.toInt(), packet.jitterMs.toInt())
-        }
-        client.lastSeenTimestamp = now
-        client.packetLossPercent = packet.packetLossPercent.toInt()
-        client.jitterMs = packet.jitterMs.toInt()
-
-        onClientListUpdated(activeClients.values.toList())
-    }
-
-    fun getConnectedCount(): Int = activeClients.size
 }
