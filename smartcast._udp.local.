@@ -1,0 +1,43 @@
+package com.gitco.smartcast.discovery
+
+import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.util.Log
+
+class SmartCastHostAdvertiser(context: Context) {
+    private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+    private var registrationListener: NsdManager.RegistrationListener? = null
+
+    fun startAdvertising(sessionName: String, port: Int) {
+        val serviceInfo = NsdServiceInfo().apply {
+            serviceName = sessionName // e.g. "Guide Blessing - Tour A"
+            serviceType = "_smartcast._udp."
+            setPort(port)
+        }
+
+        registrationListener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(NsdServiceInfo: NsdServiceInfo) {
+                Log.d("NSD", "Successfully registered: ${NsdServiceInfo.serviceName}")
+            }
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.e("NSD", "Registration failed: errorCode=$errorCode")
+            }
+            override fun onServiceUnregistered(arg0: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
+        }
+
+        nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
+    }
+
+    fun stopAdvertising() {
+        registrationListener?.let {
+            try {
+                nsdManager.unregisterService(it)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            registrationListener = null
+        }
+    }
+}
