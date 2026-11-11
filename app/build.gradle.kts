@@ -1,4 +1,26 @@
 plugins {
-    id("com.android.application") version "8.7.3" apply false
-    id("org.jetbrains.kotlin.android") version "2.1.10" apply false
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.smartcast.live"
+    compileSdk = 35
+
+    defaultConfig {
+        applicationId = "com.smartcast.live"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 2
+        versionName = "0.2.0-prototype"
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+
+dependencies {
+    implementation("org.concentus:Concentus:1.0.0")
 }
