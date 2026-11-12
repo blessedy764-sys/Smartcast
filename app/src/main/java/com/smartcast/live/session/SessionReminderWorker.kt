@@ -1,11 +1,10 @@
-package com.gitco.smartcast.reminders
+package com.smartcast.live.session
 
 import android.content.Context
-import androidx.work.Worker
-import androidx.work.WorkerParameters
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
-import com.gitco.smartcast.R
+import androidx.work.Worker
+import androidx.work.WorkerParameters
 
 class SessionReminderWorker(
     appContext: Context,
@@ -35,9 +34,8 @@ class SessionReminderWorker(
             .setAutoCancel(true)
 
         try {
-            with(NotificationManagerCompat.from(applicationContext)) {
-                notify(System.currentTimeMillis().toInt(), builder.build())
-            }
+            NotificationManagerCompat.from(applicationContext)
+                .notify(System.currentTimeMillis().toInt(), builder.build())
         } catch (e: SecurityException) {
             e.printStackTrace()
         }
