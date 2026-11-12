@@ -1,4 +1,4 @@
-package com.gitco.smartcast.audio
+package com.smartcast.live.audio
 
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
