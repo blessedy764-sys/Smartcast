@@ -4,71 +4,97 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import kotlinx.coroutines.*
+import io.github.jaredmdobson.concentus.OpusApplication
+import io.github.jaredmdobson.concentus.OpusEncoder
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
+/**
+ * Guest-side push to talk. Records the mic, encodes 20 ms Opus frames and sends them
+ * to the host as: [8 bytes clientId][opus payload]. The host only plays the approved guest.
+ */
 class PushToTalkController(
     private val hostIp: String,
     private val pttPort: Int,
-    private val encodeOpus: (ByteArray) -> ByteArray? // Uses your existing Opus C++ wrapper
+    private val clientId: Long,
+    private val onError: (String) -> Unit = {}
 ) {
-    private var isTransmitActive = false
-    private var pttJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    companion object {
+        const val SAMPLE_RATE = 48_000
+        const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
+        private const val BITRATE = 24_000
+        private const val MAX_OPUS_BYTES = 1275
+    }
+
+    private val active = AtomicBoolean(false)
+
+    val isTransmitting: Boolean get() = active.get()
 
     @SuppressLint("MissingPermission")
     fun startTransmitting() {
-        if (isTransmitActive) return
-        isTransmitActive = true
-
-        pttJob = scope.launch {
-            val sampleRate = 16000
-            val channelConfig = AudioFormat.CHANNEL_IN_MONO
-            val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-            val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-
-            val recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                minBufferSize
-            )
-
-            val socket = DatagramSocket()
-            val address = InetAddress.getByName(hostIp)
-            val buffer = ByteArray(minBufferSize)
-
-            recorder.startRecording()
+        if (!active.compareAndSet(false, true)) return
+        thread(name = "SmartCastPushToTalk") {
+            var recorder: AudioRecord? = null
+            var socket: DatagramSocket? = null
             try {
-                while (isTransmitActive && isActive) {
-                    val readBytes = recorder.read(buffer, 0, buffer.size)
-                    if (readBytes > 0) {
-                        // Compress PCM audio chunk using your Opus encoder
-                        val pcmChunk = buffer.copyOfRange(0, readBytes)
-                        val opusPayload = encodeOpus(pcmChunk)
-                        
-                        if (opusPayload != null && opusPayload.isNotEmpty()) {
-                            val packet = DatagramPacket(opusPayload, opusPayload.size, address, pttPort)
-                            socket.send(packet)
-                        }
+                val minBuffer = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+                if (minBuffer <= 0) throw IllegalStateException("Mic does not support 48 kHz on this device")
+                val mic = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuffer, FRAME_SAMPLES * 2 * 4)
+                )
+                recorder = mic
+                if (mic.state != AudioRecord.STATE_INITIALIZED) {
+                    throw IllegalStateException("Microphone could not be initialized")
+                }
+                val encoder = OpusEncoder(SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
+                encoder.setBitrate(BITRATE)
+                encoder.setComplexity(5)
+                val sock = DatagramSocket()
+                socket = sock
+                val address = InetAddress.getByName(hostIp)
+                val pcm = ShortArray(FRAME_SAMPLES)
+                val opus = ByteArray(MAX_OPUS_BYTES)
+
+                mic.startRecording()
+                while (active.get()) {
+                    var filled = 0
+                    while (active.get() && filled < FRAME_SAMPLES) {
+                        val count = mic.read(pcm, filled, FRAME_SAMPLES - filled, AudioRecord.READ_BLOCKING)
+                        if (count < 0) throw IllegalStateException("Microphone read failed: $count")
+                        if (count > 0) filled += count
+                    }
+                    if (!active.get()) break
+                    val length = encoder.encode(pcm, 0, FRAME_SAMPLES, opus, 0, opus.size)
+                    if (length > 0) {
+                        val out = ByteBuffer.allocate(8 + length)
+                        out.putLong(clientId)
+                        out.put(opus, 0, length)
+                        val bytes = out.array()
+                        sock.send(DatagramPacket(bytes, bytes.size, address, pttPort))
                     }
                 }
             } catch (e: Exception) {
-                e.printStackTrace()
+                if (active.get()) onError(e.message ?: "unknown")
+                active.set(false)
             } finally {
-                recorder.stop()
-                recorder.release()
-                socket.close()
+                try { recorder?.stop() } catch (_: Exception) {}
+                try { recorder?.release() } catch (_: Exception) {}
+                try { socket?.close() } catch (_: Exception) {}
             }
         }
     }
 
     fun stopTransmitting() {
-        isTransmitActive = false
-        pttJob?.cancel()
-        pttJob = null
+        active.set(false)
     }
 }
