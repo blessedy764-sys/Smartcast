@@ -1,37 +1,38 @@
-package com.gitco.smartcast.telemetry
+package com.smartcast.live.telemetry
 
 import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.util.UUID
 
 class HeartbeatSender(
     private val hostIp: String,
     private val telemetryPort: Int,
+    private val clientId: Long,
     private val getPacketLoss: () -> Byte,
     private val getJitter: () -> Short
 ) {
-    private val clientId: Long = UUID.randomUUID().mostSignificantBits
     private var job: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     fun start() {
+        if (job != null) return
         job = scope.launch {
             val socket = DatagramSocket()
-            val address = InetAddress.getByName(hostIp)
-            while (isActive) {
-                try {
-                    val heartbeat = HeartbeatPacket(clientId, getPacketLoss(), getJitter())
-                    val data = heartbeat.toBytes()
-                    val packet = DatagramPacket(data, data.size, address, telemetryPort)
-                    socket.send(packet)
-                } catch (e: Exception) {
-                    e.printStackTrace()
+            try {
+                val address = InetAddress.getByName(hostIp)
+                while (isActive) {
+                    try {
+                        val data = HeartbeatPacket(clientId, getPacketLoss(), getJitter()).toBytes()
+                        socket.send(DatagramPacket(data, data.size, address, telemetryPort))
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                    delay(2000) // faster than the host's 5 s timeout
                 }
-                delay(4000) // Send every 4 seconds
+            } finally {
+                socket.close()
             }
-            socket.close()
         }
     }
 
