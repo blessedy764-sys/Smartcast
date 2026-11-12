@@ -45,6 +45,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -100,6 +101,7 @@ class MainActivity : Activity() {
     @Volatile private var approved = false          // guest: host approved my hand raise
     @Volatile private var activeSpeaker: Long? = null // host: the one approved guest we play
     private var pttController: PushToTalkController? = null
+    private val guestFrames = ConcurrentLinkedQueue<ShortArray>() // decoded guest voice, mixed into the broadcast
 
     private lateinit var status: TextView
     private lateinit var banner: TextView
@@ -496,13 +498,15 @@ class MainActivity : Activity() {
         pttController = PushToTalkController(host, PTT_PORT, myClientId) { message ->
             setState("Talk error: $message")
         }.also { it.startTransmitting() }
-        setState("Talking to the host…")
+        track?.setVolume(0f) // do not play my own voice back to me with a delay
+        setState("Talking to everyone…")
     }
 
     private fun stopTalking() {
         if (pttController == null) return
         pttController?.stopTransmitting()
         pttController = null
+        track?.setVolume(1f)
         if (running.get() && !isHost) setState("Receiving and decoding Opus audio")
     }
 
@@ -536,7 +540,11 @@ class MainActivity : Activity() {
                     val id = ByteBuffer.wrap(p.data, p.offset, 8).long
                     if (id != activeSpeaker) continue
                     val samples = decoder.decode(p.data, p.offset + 8, p.length - 8, pcmOut, 0, pcmOut.size, false)
-                    if (samples > 0) out.write(pcmOut, 0, samples)
+                    if (samples > 0) {
+                        out.write(pcmOut, 0, samples) // the host hears the guest
+                        guestFrames.add(pcmOut.copyOf(samples)) // and it is mixed into the broadcast
+                        while (guestFrames.size > 10) guestFrames.poll() // cap delay at about 200 ms
+                    }
                 }
             } catch (_: Exception) {
             } finally {
@@ -579,6 +587,7 @@ class MainActivity : Activity() {
         tracker.clear()
         handRequests.clear()
         activeSpeaker = null
+        guestFrames.clear()
         running.set(true)
         startAudioService(true)
         startHealthMonitoring()
@@ -622,6 +631,7 @@ class MainActivity : Activity() {
                 AudioEffectsManager.attachEffects(mic.audioSessionId)
                 setState(if (key == null) "Broadcasting Opus audio over local Wi-Fi" else "Broadcasting encrypted audio (PIN room)")
                 var sequence = 0
+                var guestPrimed = false
                 val sessionId = (System.nanoTime() xor android.os.Process.myPid().toLong()).toInt()
                 while (running.get()) {
                     var filled = 0
@@ -631,6 +641,19 @@ class MainActivity : Activity() {
                         if (count > 0) filled += count
                     }
                     if (!running.get()) break
+                    // mix the approved guest's voice into the broadcast (jitter buffer: wait for 3 frames)
+                    if (!guestPrimed && guestFrames.size >= 3) guestPrimed = true
+                    if (guestPrimed) {
+                        val guest = guestFrames.poll()
+                        if (guest == null) {
+                            guestPrimed = false
+                        } else {
+                            val n = minOf(guest.size, FRAME_SAMPLES)
+                            for (i in 0 until n) {
+                                pcm[i] = (pcm[i] + guest[i]).coerceIn(-32768, 32767).toShort()
+                            }
+                        }
+                    }
                     // apply bitrate changes requested by the health monitor
                     val wanted = requestedBitrate
                     if (wanted != currentBitrate) {
@@ -834,6 +857,7 @@ class MainActivity : Activity() {
         socket = null
         handRequests.clear()
         activeSpeaker = null
+        guestFrames.clear()
         approved = false
         tracker.clear()
         hostAddress = null
