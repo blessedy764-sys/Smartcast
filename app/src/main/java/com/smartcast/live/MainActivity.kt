@@ -1,4 +1,4 @@
-package com.smartcast.live.qa
+import com.smartcast.live.qa.MainActivity
 
 import android.Manifest
 import android.app.Activity
