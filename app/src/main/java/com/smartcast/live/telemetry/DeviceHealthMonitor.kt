@@ -1,4 +1,4 @@
- package com.example.smartcast.telemetry
+package com.smartcast.live.telemetry
 
 import android.content.BroadcastReceiver
 import android.content.Context
