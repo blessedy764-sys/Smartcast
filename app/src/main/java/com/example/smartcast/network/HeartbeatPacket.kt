@@ -9,7 +9,7 @@ data class HeartbeatPacket(
     val jitter: Short
 ) {
     fun toBytes(): ByteArray {
-        val buffer = ByteBuffer.allocate(11)
+        val buffer = ByteBuffer.allocate(SIZE)
             .order(ByteOrder.BIG_ENDIAN)
 
         buffer.putLong(clientId)
@@ -20,10 +20,12 @@ data class HeartbeatPacket(
     }
 
     companion object {
-        fun fromBytes(data: ByteArray): HeartbeatPacket? {
-            if (data.size < 11) return null
+        private const val SIZE = 11
 
-            val buffer = ByteBuffer.wrap(data)
+        fun fromBytes(data: ByteArray, length: Int = data.size): HeartbeatPacket? {
+            if (length < SIZE || length > data.size) return null
+
+            val buffer = ByteBuffer.wrap(data, 0, length)
                 .order(ByteOrder.BIG_ENDIAN)
 
             return HeartbeatPacket(
