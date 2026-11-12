@@ -1,4 +1,4 @@
-import com.smartcast.live.qa.MainActivity
+package com.smartcast.live.service
 
 import android.app.Notification
 import android.app.NotificationChannel
