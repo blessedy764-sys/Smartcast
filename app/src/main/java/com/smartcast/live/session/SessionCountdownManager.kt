@@ -1,4 +1,4 @@
-package com.gitco.smartcast.sessions
+package com.smartcast.live.session
 
 import android.os.CountDownTimer
 import java.util.concurrent.TimeUnit
@@ -20,9 +20,11 @@ class SessionCountdownManager(
         }
 
         timer = object : CountDownTimer(diff, 1000) {
-            override fun millisUntilFinished(millisUntilFinished: Long) {
-                // Check if we entered "Starting Soon" window (< 5 minutes)
-                if (millisUntilFinished <= TimeUnit.MINUTES.toMillis(5) && session.status == SessionStatus.SCHEDULED) {
+            override fun onTick(millisUntilFinished: Long) {
+                // Check if we entered the "Starting Soon" window (< 5 minutes)
+                if (millisUntilFinished <= TimeUnit.MINUTES.toMillis(5) &&
+                    session.status == SessionStatus.SCHEDULED
+                ) {
                     session.status = SessionStatus.STARTING_SOON
                     onStatusChanged(SessionStatus.STARTING_SOON)
                 }
@@ -33,19 +35,7 @@ class SessionCountdownManager(
                 val seconds = TimeUnit.MILLISECONDS.toSeconds(millisUntilFinished) % 60
                 val formatted = String.format("%02d : %02d : %02d", hours, minutes, seconds)
 
-                onTick(formatted, millisUntilFinished)
+                this@SessionCountdownManager.onTick(formatted, millisUntilFinished)
             }
 
             override fun onFinish() {
-                session.status = SessionStatus.LIVE
-                onStatusChanged(SessionStatus.LIVE)
-                onTimeZeroReached()
-            }
-        }.start()
-    }
-
-    fun stop() {
-        timer?.cancel()
-        timer = null
-    }
-}
