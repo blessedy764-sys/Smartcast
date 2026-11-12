@@ -1,4 +1,4 @@
-package com.gitco.smartcast.security
+package com.smartcast.live.security 
 
 import android.util.Base64
 import javax.crypto.Cipher
