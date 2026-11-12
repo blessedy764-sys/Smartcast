@@ -1,4 +1,4 @@
-package com.gitco.smartcast.qa
+package com.smartcast.live.qa
 
 import android.annotation.SuppressLint
 import android.media.AudioFormat
