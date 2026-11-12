@@ -21,7 +21,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
-import com.smartcast.live.audio.AudioEffectsManager // NEW (effects)
+import com.smartcast.live.audio.AudioEffectsManager
 import com.smartcast.live.service.SmartCastAudioService
 import com.smartcast.live.telemetry.DeviceHealthMonitor
 import io.github.jaredmdobson.concentus.OpusApplication
@@ -254,7 +254,7 @@ class MainActivity : Activity() {
                 )
                 if (minBuffer <= 0) throw IllegalStateException("AudioRecord does not support 48 kHz input on this device")
                 val mic = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION, // CHANGED (effects)
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
@@ -275,7 +275,7 @@ class MainActivity : Activity() {
                 sock.timeToLive = 1
                 socket = sock
                 mic.startRecording()
-                AudioEffectsManager.attachEffects(mic.audioSessionId) // NEW (effects)
+                AudioEffectsManager.attachEffects(mic.audioSessionId)
                 setState("Broadcasting Opus audio over local Wi-Fi")
                 var sequence = 0
                 val sessionId = (System.nanoTime() xor android.os.Process.myPid().toLong()).toInt()
@@ -313,7 +313,7 @@ class MainActivity : Activity() {
                 running.set(false)
             } finally {
                 try { input?.stop() } catch (_: Exception) {}
-                AudioEffectsManager.release() // NEW (effects)
+                AudioEffectsManager.releaseEffects() // FIXED
                 try { input?.release() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
                 recorder = null
