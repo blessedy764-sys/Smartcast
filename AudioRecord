@@ -1,0 +1,17 @@
+// Inside your Host audio capture initialization:
+val audioRecord = AudioRecord(
+    MediaRecorder.AudioSource.VOICE_COMMUNICATION, // Best source profile for voice clarity
+    16000,                                       // Sample rate (16 kHz matches Opus VoIP setup)
+    AudioFormat.CHANNEL_IN_MONO,
+    AudioFormat.ENCODING_PCM_16BIT,
+    bufferSize
+)
+
+// Start recording session
+audioRecord.startRecording()
+
+// ATTACH EFFECTS USING THE SESSION ID
+val sessionId = audioRecord.audioSessionId
+if (sessionId != AudioRecord.ERROR_INVALID_OPERATION) {
+    AudioEffectsManager.attachEffects(sessionId)
+}
