@@ -12,6 +12,8 @@ import android.media.AudioManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager // NEW
+import android.view.View // NEW
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -20,6 +22,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.service.SmartCastAudioService
+import com.smartcast.live.telemetry.DeviceHealthMonitor // NEW
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
@@ -40,6 +43,7 @@ class MainActivity : Activity() {
         private const val SAMPLE_RATE = 48_000
         private const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
         private const val BITRATE = 32_000
+        private const val LOW_BITRATE = 16_000 // NEW: used when the phone is warm
         private const val HEADER_SIZE = 24
         private const val MAGIC = 0x53434F50 // "SCOP"
         private const val VERSION: Byte = 1
@@ -52,7 +56,11 @@ class MainActivity : Activity() {
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var track: AudioTrack? = null
     @Volatile private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var requestedBitrate = BITRATE // NEW
+    private var healthMonitor: DeviceHealthMonitor? = null // NEW
+    private var lowBatteryShown = false // NEW
     private lateinit var status: TextView
+    private lateinit var banner: TextView // NEW
     private lateinit var details: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +105,14 @@ class MainActivity : Activity() {
             setPadding(0, 24, 0, 12)
         }
         page.addView(status)
+        // NEW: warning banner, hidden until needed
+        banner = TextView(this).apply {
+            visibility = View.GONE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(20, 14, 20, 14)
+        }
+        page.addView(banner)
         page.addView(section("SMARTCAST LIVE"))
         page.addView(button("Start broadcasting") { startHost() })
         page.addView(button("Join as receiver") { startReceiver() })
@@ -141,6 +157,62 @@ class MainActivity : Activity() {
         runOnUiThread { status.text = "Status: $message" }
     }
 
+    // ---------- NEW: device health (heat + battery) ----------
+
+    private fun showBanner(message: String, color: Int) {
+        runOnUiThread {
+            banner.text = message
+            banner.setBackgroundColor(color)
+            banner.visibility = View.VISIBLE
+        }
+    }
+
+    private fun hideBanner() {
+        runOnUiThread { banner.visibility = View.GONE }
+    }
+
+    private fun showThermalWarningBanner(message: String) = showBanner(message, 0xFFB45309.toInt())
+
+    private fun showCriticalAlert(message: String) = showBanner(message, 0xFFB91C1C.toInt())
+
+    private fun showLowBatteryWarning() =
+        showBanner("Battery low (15% or less). Plug in to keep broadcasting.", 0xFFB45309.toInt())
+
+    private fun startHealthMonitoring() {
+        stopHealthMonitoring()
+        lowBatteryShown = false
+        requestedBitrate = BITRATE
+        val monitor = DeviceHealthMonitor(this) { state ->
+            when {
+                state.thermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> {
+                    showCriticalAlert("Device overheating. Stopping broadcast to prevent shutdown.")
+                    stopSession(keepBanner = true)
+                }
+                state.thermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> {
+                    requestedBitrate = LOW_BITRATE // encoder picks this up on the next frame
+                    showThermalWarningBanner("Device running warm. Optimizing audio stream...")
+                }
+                else -> {
+                    requestedBitrate = BITRATE
+                    if (lowBatteryShown) Unit else hideBanner()
+                }
+            }
+            if (running.get() && state.batteryLevelPercent <= 15 && !state.isCharging && !lowBatteryShown) {
+                lowBatteryShown = true
+                showLowBatteryWarning()
+            }
+        }
+        healthMonitor = monitor
+        monitor.startMonitoring()
+    }
+
+    private fun stopHealthMonitoring() {
+        healthMonitor?.stopMonitoring()
+        healthMonitor = null
+    }
+
+    // ---------------------------------------------------------
+
     private fun acquireMulticastLock() {
         if (multicastLock?.isHeld == true) return
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -170,6 +242,7 @@ class MainActivity : Activity() {
         }
         running.set(true)
         startAudioService(true)
+        startHealthMonitoring() // NEW
         setState("Starting Opus broadcaster…")
         thread(name = "SmartCastOpusHost") {
             var input: AudioRecord? = null
@@ -193,6 +266,7 @@ class MainActivity : Activity() {
                 val encoder = OpusEncoder(SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
                 encoder.setBitrate(BITRATE)
                 encoder.setComplexity(5)
+                var currentBitrate = BITRATE // NEW
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
                 val address = InetAddress.getByName(GROUP)
@@ -212,6 +286,12 @@ class MainActivity : Activity() {
                         if (count > 0) filled += count
                     }
                     if (!running.get()) break
+                    // NEW: apply bitrate changes requested by the health monitor
+                    val wanted = requestedBitrate
+                    if (wanted != currentBitrate) {
+                        encoder.setBitrate(wanted)
+                        currentBitrate = wanted
+                    }
                     val encodedLength = encoder.encode(pcm, 0, FRAME_SAMPLES, encoded, 0, encoded.size)
                     if (encodedLength > 0) {
                         val packetData = ByteBuffer.allocate(HEADER_SIZE + encodedLength).order(ByteOrder.BIG_ENDIAN)
@@ -245,6 +325,7 @@ class MainActivity : Activity() {
         if (running.get()) { toast("Stop the current session first."); return }
         running.set(true)
         startAudioService(false)
+        startHealthMonitoring() // NEW
         setState("Searching for Opus broadcast…")
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
@@ -332,8 +413,10 @@ class MainActivity : Activity() {
         multicastLock = null
     }
 
-    private fun stopSession() {
+    private fun stopSession(keepBanner: Boolean = false) { // CHANGED: optional parameter
         running.set(false)
+        stopHealthMonitoring() // NEW
+        if (!keepBanner) hideBanner() // NEW
         try { stopService(Intent(this, SmartCastAudioService::class.java)) } catch (_: Exception) {}
         try { recorder?.stop() } catch (_: Exception) {}
         try { track?.pause(); track?.flush(); track?.stop() } catch (_: Exception) {}
