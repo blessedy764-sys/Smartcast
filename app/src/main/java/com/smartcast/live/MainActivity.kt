@@ -1,4 +1,4 @@
-package com.smartcast.live.qa 
+package com.smartcast.live.qa
 
 import android.Manifest
 import android.app.Activity
@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.text.InputType
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -26,8 +27,6 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
-import com.smartcast.live.qa.HandRaiseAction
-import com.smartcast.live.qa.HandRaisePacket
 import com.smartcast.live.room.ClientTracker
 import com.smartcast.live.security.RoomSecurity
 import com.smartcast.live.service.SmartCastAudioService
@@ -59,6 +58,7 @@ class MainActivity : Activity() {
         private const val PORT = 50005
         private const val TELEMETRY_PORT = 50006 // guests -> host heartbeats
         private const val HAND_PORT = 50007      // hand raise requests and replies
+        private const val PTT_PORT = 50008       // approved guest voice -> host
         private const val SAMPLE_RATE = 48_000
         private const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
         private const val BITRATE = 32_000
@@ -96,6 +96,11 @@ class MainActivity : Activity() {
     @Volatile private var handRaised = false
     @Volatile private var handStatus = HAND_IDLE
 
+    // push to talk
+    @Volatile private var approved = false          // guest: host approved my hand raise
+    @Volatile private var activeSpeaker: Long? = null // host: the one approved guest we play
+    private var pttController: PushToTalkController? = null
+
     private lateinit var status: TextView
     private lateinit var banner: TextView
     private lateinit var details: TextView
@@ -103,6 +108,7 @@ class MainActivity : Activity() {
     private lateinit var participantsView: TextView
     private lateinit var handView: TextView
     private lateinit var handButton: Button
+    private lateinit var talkButton: Button
     private lateinit var requestsBox: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -190,6 +196,17 @@ class MainActivity : Activity() {
         page.addView(handView)
         handButton = button("Raise hand") { toggleHand() }
         page.addView(handButton)
+        talkButton = button("Hold to talk") { }.apply {
+            isEnabled = false
+            setOnTouchListener { _, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> startTalking()
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> stopTalking()
+                }
+                true
+            }
+        }
+        page.addView(talkButton)
         requestsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(requestsBox)
 
@@ -357,7 +374,10 @@ class MainActivity : Activity() {
     private fun onHostHandPacket(msg: HandRaisePacket, address: String) {
         when (msg.action) {
             HandRaiseAction.REQUEST -> handRequests[msg.clientId] = address
-            HandRaiseAction.RELEASE, HandRaiseAction.DENY -> handRequests.remove(msg.clientId)
+            HandRaiseAction.RELEASE, HandRaiseAction.DENY -> {
+                handRequests.remove(msg.clientId)
+                if (activeSpeaker == msg.clientId) activeSpeaker = null
+            }
             HandRaiseAction.APPROVE -> {}
         }
         refreshRoomUi()
@@ -366,8 +386,13 @@ class MainActivity : Activity() {
     private fun onGuestHandPacket(msg: HandRaisePacket) {
         if (msg.clientId != myClientId) return
         when (msg.action) {
-            HandRaiseAction.APPROVE -> handStatus = "✅ Approved. The host will let you speak."
+            HandRaiseAction.APPROVE -> {
+                approved = true
+                handStatus = "✅ Approved. Hold the button to talk."
+            }
             HandRaiseAction.DENY -> {
+                approved = false
+                stopTalking()
                 handRaised = false
                 handStatus = "Hand lowered by host"
             }
@@ -381,6 +406,10 @@ class MainActivity : Activity() {
         val host = hostAddress
         if (host == null) { toast("Waiting for the host's audio..."); return }
         handRaised = !handRaised
+        if (!handRaised) {
+            approved = false
+            stopTalking()
+        }
         handStatus = if (handRaised) "✋ Hand raised. Waiting for the host." else "Hand lowered"
         sendHand(host, HandRaisePacket(myClientId, if (handRaised) HandRaiseAction.REQUEST else HandRaiseAction.RELEASE))
         updateHandUi()
@@ -390,6 +419,7 @@ class MainActivity : Activity() {
         runOnUiThread {
             handButton.text = if (handRaised) "Lower hand" else "Raise hand"
             handView.text = handStatus
+            talkButton.isEnabled = approved
         }
     }
 
@@ -411,6 +441,7 @@ class MainActivity : Activity() {
                         isAllCaps = false
                         setOnClickListener {
                             handRequests.remove(id)
+                            activeSpeaker = id
                             sendHand(addr, HandRaisePacket(id, HandRaiseAction.APPROVE))
                             refreshRoomUi()
                         }
@@ -451,6 +482,69 @@ class MainActivity : Activity() {
         runOnUiThread { participantsView.text = "Connected to host $address" }
     }
 
+    // ---------- push to talk ----------
+
+    /** Guest: start sending my mic to the host while the button is held (only when approved). */
+    private fun startTalking() {
+        if (!approved || isHost || !running.get()) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestNeededPermissions()
+            return
+        }
+        val host = hostAddress ?: return
+        pttController?.stopTransmitting()
+        pttController = PushToTalkController(host, PTT_PORT, myClientId) { message ->
+            setState("Talk error: $message")
+        }.also { it.startTransmitting() }
+        setState("Talking to the host…")
+    }
+
+    private fun stopTalking() {
+        if (pttController == null) return
+        pttController?.stopTransmitting()
+        pttController = null
+        if (running.get() && !isHost) setState("Receiving and decoding Opus audio")
+    }
+
+    /** Host: decode and play voice from the approved guest only. */
+    private fun startPttListener() {
+        thread(name = "SmartCastPttReceive") {
+            var sink: AudioTrack? = null
+            try {
+                val s = openUdp(PTT_PORT)
+                val minBuffer = AudioTrack.getMinBufferSize(
+                    SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+                if (minBuffer <= 0) throw IllegalStateException("AudioTrack does not support 48 kHz output on this device")
+                val out = AudioTrack(
+                    AudioManager.STREAM_MUSIC,
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuffer, FRAME_SAMPLES * 2 * 4),
+                    AudioTrack.MODE_STREAM
+                )
+                sink = out
+                out.play()
+                val decoder = OpusDecoder(SAMPLE_RATE, 1)
+                val pcmOut = ShortArray(5760)
+                val buf = ByteArray(8 + MAX_OPUS_BYTES + 64)
+                while (running.get()) {
+                    val p = DatagramPacket(buf, buf.size)
+                    s.receive(p)
+                    if (p.length <= 8) continue
+                    val id = ByteBuffer.wrap(p.data, p.offset, 8).long
+                    if (id != activeSpeaker) continue
+                    val samples = decoder.decode(p.data, p.offset + 8, p.length - 8, pcmOut, 0, pcmOut.size, false)
+                    if (samples > 0) out.write(pcmOut, 0, samples)
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { sink?.pause(); sink?.flush(); sink?.stop(); sink?.release() } catch (_: Exception) {}
+            }
+        }
+    }
+
     // ---------------------------------------------------------
 
     private fun acquireMulticastLock() {
@@ -484,11 +578,13 @@ class MainActivity : Activity() {
         isHost = true
         tracker.clear()
         handRequests.clear()
+        activeSpeaker = null
         running.set(true)
         startAudioService(true)
         startHealthMonitoring()
         startHostListeners()
         startHandListener()
+        startPttListener()
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
         thread(name = "SmartCastOpusHost") {
@@ -583,6 +679,7 @@ class MainActivity : Activity() {
         lostFrames.set(0)
         totalFrames.set(0)
         handRaised = false
+        approved = false
         handStatus = "Hand raise: tap to ask to speak"
         updateHandUi()
         running.set(true)
@@ -719,6 +816,7 @@ class MainActivity : Activity() {
     private fun stopSession(keepBanner: Boolean = false) {
         running.set(false)
         isHost = false
+        stopTalking()
         stopHealthMonitoring()
         if (!keepBanner) hideBanner()
         uiHandler.removeCallbacks(refreshTick)
@@ -735,6 +833,8 @@ class MainActivity : Activity() {
         track = null
         socket = null
         handRequests.clear()
+        activeSpeaker = null
+        approved = false
         tracker.clear()
         hostAddress = null
         handRaised = false
