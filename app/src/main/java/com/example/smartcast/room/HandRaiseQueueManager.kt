@@ -1,4 +1,4 @@
-package com.gitco.smartcast.qa
+package com.smartcast.live.qa
 
 class HandRaiseQueueManager(private val onQueueChanged: (List<Long>) -> Unit) {
     private val pendingQueue = mutableListOf<Long>()
