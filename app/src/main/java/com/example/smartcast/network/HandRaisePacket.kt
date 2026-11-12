@@ -1,4 +1,4 @@
-package com.smartcast.live.qa 
+package com.smartcast.live.qa
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
