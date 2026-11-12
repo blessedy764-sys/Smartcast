@@ -12,8 +12,8 @@ import android.media.AudioManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager // NEW
-import android.view.View // NEW
+import android.os.PowerManager
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -21,8 +21,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
+import com.smartcast.live.audio.AudioEffectsManager // NEW (effects)
 import com.smartcast.live.service.SmartCastAudioService
-import com.smartcast.live.telemetry.DeviceHealthMonitor // NEW
+import com.smartcast.live.telemetry.DeviceHealthMonitor
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
@@ -43,7 +44,7 @@ class MainActivity : Activity() {
         private const val SAMPLE_RATE = 48_000
         private const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
         private const val BITRATE = 32_000
-        private const val LOW_BITRATE = 16_000 // NEW: used when the phone is warm
+        private const val LOW_BITRATE = 16_000 // used when the phone is warm
         private const val HEADER_SIZE = 24
         private const val MAGIC = 0x53434F50 // "SCOP"
         private const val VERSION: Byte = 1
@@ -56,11 +57,11 @@ class MainActivity : Activity() {
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var track: AudioTrack? = null
     @Volatile private var multicastLock: WifiManager.MulticastLock? = null
-    @Volatile private var requestedBitrate = BITRATE // NEW
-    private var healthMonitor: DeviceHealthMonitor? = null // NEW
-    private var lowBatteryShown = false // NEW
+    @Volatile private var requestedBitrate = BITRATE
+    private var healthMonitor: DeviceHealthMonitor? = null
+    private var lowBatteryShown = false
     private lateinit var status: TextView
-    private lateinit var banner: TextView // NEW
+    private lateinit var banner: TextView
     private lateinit var details: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -105,7 +106,6 @@ class MainActivity : Activity() {
             setPadding(0, 24, 0, 12)
         }
         page.addView(status)
-        // NEW: warning banner, hidden until needed
         banner = TextView(this).apply {
             visibility = View.GONE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -157,7 +157,7 @@ class MainActivity : Activity() {
         runOnUiThread { status.text = "Status: $message" }
     }
 
-    // ---------- NEW: device health (heat + battery) ----------
+    // ---------- device health (heat + battery) ----------
 
     private fun showBanner(message: String, color: Int) {
         runOnUiThread {
@@ -242,7 +242,7 @@ class MainActivity : Activity() {
         }
         running.set(true)
         startAudioService(true)
-        startHealthMonitoring() // NEW
+        startHealthMonitoring()
         setState("Starting Opus broadcaster…")
         thread(name = "SmartCastOpusHost") {
             var input: AudioRecord? = null
@@ -254,7 +254,7 @@ class MainActivity : Activity() {
                 )
                 if (minBuffer <= 0) throw IllegalStateException("AudioRecord does not support 48 kHz input on this device")
                 val mic = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION, // CHANGED (effects)
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
@@ -266,7 +266,7 @@ class MainActivity : Activity() {
                 val encoder = OpusEncoder(SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
                 encoder.setBitrate(BITRATE)
                 encoder.setComplexity(5)
-                var currentBitrate = BITRATE // NEW
+                var currentBitrate = BITRATE
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
                 val address = InetAddress.getByName(GROUP)
@@ -275,6 +275,7 @@ class MainActivity : Activity() {
                 sock.timeToLive = 1
                 socket = sock
                 mic.startRecording()
+                AudioEffectsManager.attachEffects(mic.audioSessionId) // NEW (effects)
                 setState("Broadcasting Opus audio over local Wi-Fi")
                 var sequence = 0
                 val sessionId = (System.nanoTime() xor android.os.Process.myPid().toLong()).toInt()
@@ -286,7 +287,7 @@ class MainActivity : Activity() {
                         if (count > 0) filled += count
                     }
                     if (!running.get()) break
-                    // NEW: apply bitrate changes requested by the health monitor
+                    // apply bitrate changes requested by the health monitor
                     val wanted = requestedBitrate
                     if (wanted != currentBitrate) {
                         encoder.setBitrate(wanted)
@@ -312,6 +313,7 @@ class MainActivity : Activity() {
                 running.set(false)
             } finally {
                 try { input?.stop() } catch (_: Exception) {}
+                AudioEffectsManager.release() // NEW (effects)
                 try { input?.release() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
                 recorder = null
@@ -325,7 +327,7 @@ class MainActivity : Activity() {
         if (running.get()) { toast("Stop the current session first."); return }
         running.set(true)
         startAudioService(false)
-        startHealthMonitoring() // NEW
+        startHealthMonitoring()
         setState("Searching for Opus broadcast…")
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
@@ -413,10 +415,10 @@ class MainActivity : Activity() {
         multicastLock = null
     }
 
-    private fun stopSession(keepBanner: Boolean = false) { // CHANGED: optional parameter
+    private fun stopSession(keepBanner: Boolean = false) {
         running.set(false)
-        stopHealthMonitoring() // NEW
-        if (!keepBanner) hideBanner() // NEW
+        stopHealthMonitoring()
+        if (!keepBanner) hideBanner()
         try { stopService(Intent(this, SmartCastAudioService::class.java)) } catch (_: Exception) {}
         try { recorder?.stop() } catch (_: Exception) {}
         try { track?.pause(); track?.flush(); track?.stop() } catch (_: Exception) {}
