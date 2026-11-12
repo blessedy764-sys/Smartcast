@@ -1,4 +1,4 @@
-package com.gitco.smartcast.telemetry
+package com.smartcast.live.telemetry 
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
