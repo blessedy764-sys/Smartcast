@@ -11,7 +11,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import com.smartcast.live.MainActivity
+import com.smartcast.live.qa.MainActivity
 
 class SmartCastAudioService : Service() {
     companion object {
