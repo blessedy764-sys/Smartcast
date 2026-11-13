@@ -28,6 +28,8 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
+import com.smartcast.live.discovery.SmartCastAdvertiser
+import com.smartcast.live.discovery.SmartCastDiscovery
 import com.smartcast.live.network.PttReceiver
 import com.smartcast.live.network.PttSender
 import com.smartcast.live.qr.QrCodeGenerator
@@ -130,6 +132,9 @@ class MainActivity : Activity() {
     private lateinit var talkButton: Button
     private lateinit var requestsBox: LinearLayout
     private lateinit var qrImage: ImageView
+    private lateinit var sessionsBox: LinearLayout
+    private val advertiser by lazy { SmartCastAdvertiser(applicationContext) } // host: announce the session
+    private var discovery: SmartCastDiscovery? = null                         // guest: look for sessions
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -206,6 +211,9 @@ class MainActivity : Activity() {
             setPadding(0, 16, 0, 16)
         }
         page.addView(qrImage)
+        page.addView(button("Find sessions nearby") { findSessions() })
+        sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(sessionsBox)
 
         // ---- Room: participants + hand raise ----
         page.addView(section("ROOM"))
@@ -669,6 +677,7 @@ class MainActivity : Activity() {
         startHostListeners()
         startHandListener()
         startPttListener(pin)
+        advertiser.start(PORT, "SmartCast Session", pin.isNotEmpty())
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
         thread(name = "SmartCastOpusHost") {
@@ -947,10 +956,49 @@ class MainActivity : Activity() {
         updateHandUi()
         refreshRoomUi()
         runOnUiThread { qrImage.visibility = View.GONE }
+        advertiser.stop()
+        stopFindingSessions()
         setState("Stopped")
     }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+    // ---------- find sessions nearby (network discovery) ----------
+
+    private fun findSessions() {
+        if (running.get()) { toast("Stop the current session first."); return }
+        stopFindingSessions()
+        sessionsBox.addView(TextView(this).apply {
+            tag = "searching"
+            text = "Searching for sessions on this Wi-Fi…"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFF536579.toInt())
+        })
+        discovery = SmartCastDiscovery(applicationContext) { info ->
+            runOnUiThread { addSessionRow(info.serviceName, info.host?.hostAddress ?: "", info.attributes["pin"]?.let { String(it) } == "1") }
+        }.also { it.startDiscovery() }
+    }
+
+    private fun stopFindingSessions() {
+        discovery?.stopDiscovery()
+        discovery = null
+        runOnUiThread { sessionsBox.removeAllViews() }
+    }
+
+    private fun addSessionRow(name: String, host: String, pinProtected: Boolean) {
+        sessionsBox.findViewWithTag<View>("searching")?.let { sessionsBox.removeView(it) }
+        val key = "$name@$host"
+        if (sessionsBox.findViewWithTag<View>(key) != null) return // already listed
+        sessionsBox.addView(button("$name · $host" + if (pinProtected) " 🔒" else "") {
+            if (pinProtected && pinInput.text.toString().trim().isEmpty()) {
+                toast("This room has a PIN. Enter it first.")
+            } else {
+                stopFindingSessions()
+                toast("Joining $name…")
+                startReceiver()
+            }
+        }.also { it.tag = key })
+    }
 
     // ---------- join by QR code ----------
 
