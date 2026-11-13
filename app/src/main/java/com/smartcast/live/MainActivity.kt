@@ -9,6 +9,9 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.AudioManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
@@ -36,9 +39,10 @@ import com.smartcast.live.discovery.SmartCastAdvertiser
 import com.smartcast.live.discovery.SmartCastDiscovery
 import com.smartcast.live.network.PttReceiver
 import com.smartcast.live.network.PttSender
-import com.smartcast.live.qr.QrCodeGenerator
-import com.smartcast.live.qr.SessionConnectionConfig
-import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.integration.android.IntentIntegrator
+import com.google.zxing.qrcode.QRCodeWriter
 import com.smartcast.live.room.ClientTracker
 import com.smartcast.live.security.RoomSecurity
 import com.smartcast.live.service.SmartCastAudioService
@@ -141,6 +145,16 @@ class MainActivity : Activity() {
     private lateinit var chatView: LiveChatView
     @Volatile private var chatSocket: MulticastSocket? = null
     @Volatile private var chatKey: SecretKeySpec? = null
+
+    // multi-room: every host broadcasts on its own multicast group, so rooms never mix
+    @Volatile private var roomGroup = GROUP
+    private lateinit var roomNameInput: EditText
+    private lateinit var roomView: TextView
+
+    // unique join QR: each broadcast gets a fresh random session ID that goes into the QR code
+    @Volatile private var hostSessionId = 0
+    @Volatile private var hostRoomName = "SmartCast Session"
+    @Volatile private var hostHasPin = false
     private val advertiser by lazy { SmartCastAdvertiser(applicationContext) } // host: announce the session
     private var discovery: SmartCastDiscovery? = null                         // guest: look for sessions
 
@@ -186,6 +200,13 @@ class MainActivity : Activity() {
             setPadding(0, 24, 0, 12)
         }
         page.addView(status)
+        roomView = TextView(this).apply {
+            text = "Room: not connected"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFF12345A.toInt())
+            setPadding(0, 0, 0, 12)
+        }
+        page.addView(roomView)
         banner = TextView(this).apply {
             visibility = View.GONE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -208,8 +229,13 @@ class MainActivity : Activity() {
         })
 
         page.addView(section("SMARTCAST LIVE"))
+        roomNameInput = EditText(this).apply {
+            hint = "Room name for hosts (e.g. Main Hall)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+        }
+        page.addView(roomNameInput)
         page.addView(button("Start broadcasting") { startHost() })
-        page.addView(button("Join as receiver") { startReceiver() })
         page.addView(button("Stop session") { stopSession() })
         page.addView(button("Show join QR code") { showJoinQr() })
         page.addView(button("Scan QR code to join") { scanJoinQr() })
@@ -219,7 +245,7 @@ class MainActivity : Activity() {
             setPadding(0, 16, 0, 16)
         }
         page.addView(qrImage)
-        page.addView(button("Find sessions nearby") { findSessions() })
+        page.addView(button("Find rooms / switch room") { findSessions() })
         sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(sessionsBox)
 
@@ -272,7 +298,7 @@ class MainActivity : Activity() {
             setTextColor(0xFF536579.toInt())
         })
         details = TextView(this).apply {
-            text = "LAN multicast: $GROUP:$PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames"
+            text = "LAN multicast: one group per room (239.10.x.y), port $PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF64748B.toInt())
             setPadding(0, 20, 0, 0)
@@ -558,6 +584,7 @@ class MainActivity : Activity() {
 
     /** Everyone (host and guests) joins the chat multicast group and listens for messages. */
     private fun startChat(pin: String) {
+        val group = roomGroup // chat lives inside the room's own multicast group
         chatView.clear()
         thread(name = "SmartCastChat") {
             var sock: MulticastSocket? = null
@@ -569,7 +596,7 @@ class MainActivity : Activity() {
                 sock = s
                 s.reuseAddress = true
                 s.bind(InetSocketAddress(CHAT_PORT))
-                s.joinGroup(InetAddress.getByName(GROUP))
+                s.joinGroup(InetAddress.getByName(group))
                 auxSockets.add(s) // closed by stopSession
                 chatSocket = s
                 val buf = ByteArray(1024)
@@ -588,7 +615,7 @@ class MainActivity : Activity() {
             } catch (_: Exception) {
             } finally {
                 chatSocket = null
-                try { sock?.leaveGroup(InetAddress.getByName(GROUP)) } catch (_: Exception) {}
+                try { sock?.leaveGroup(InetAddress.getByName(group)) } catch (_: Exception) {}
                 try { sock?.close() } catch (_: Exception) {}
             }
         }
@@ -604,7 +631,7 @@ class MainActivity : Activity() {
         val bytes = ChatCodec.encode(ChatMessage(myClientId, isHost, reaction, clean), chatKey)
         thread(name = "SmartCastChatSend") {
             try {
-                s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(GROUP), CHAT_PORT))
+                s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(roomGroup), CHAT_PORT))
             } catch (_: Exception) {}
         }
     }
@@ -732,6 +759,16 @@ class MainActivity : Activity() {
             return
         }
         val pin = pinInput.text.toString().trim()
+        val group = groupForIp(localIpv4()) ?: run {
+            toast("No Wi-Fi address found. Connect to Wi-Fi or turn on the hotspot.")
+            return
+        }
+        val roomName = roomNameInput.text.toString().trim().ifEmpty { "SmartCast Session" }
+        roomGroup = group
+        hostSessionId = SecureRandom().nextInt().let { if (it == 0) 1 else it } // new QR for every broadcast
+        hostRoomName = roomName
+        hostHasPin = pin.isNotEmpty()
+        setRoomLabel("Room: $roomName ($group)")
         isHost = true
         tracker.clear()
         handRequests.clear()
@@ -746,7 +783,7 @@ class MainActivity : Activity() {
         startHandListener()
         startPttListener(pin)
         startChat(pin)
-        advertiser.start(PORT, "SmartCast Session", pin.isNotEmpty())
+        advertiser.start(PORT, roomName, pin.isNotEmpty())
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
         thread(name = "SmartCastOpusHost") {
@@ -779,7 +816,7 @@ class MainActivity : Activity() {
                 var currentBitrate = BITRATE
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
-                val address = InetAddress.getByName(GROUP)
+                val address = InetAddress.getByName(group)
                 val sock = MulticastSocket()
                 udp = sock
                 sock.timeToLive = 1
@@ -789,7 +826,7 @@ class MainActivity : Activity() {
                 setState(if (key == null) "Broadcasting Opus audio over local Wi-Fi" else "Broadcasting encrypted audio (PIN room)")
                 var sequence = 0
                 var guestPrimed = false
-                val sessionId = (System.nanoTime() xor android.os.Process.myPid().toLong()).toInt()
+                val sessionId = hostSessionId // same value the join QR code carries
                 while (running.get()) {
                     var filled = 0
                     while (running.get() && filled < FRAME_SAMPLES) {
@@ -851,9 +888,12 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startReceiver() {
+    /** [requiredSession] is set when joining by QR: only audio from that exact broadcast is accepted. */
+    private fun startReceiver(group: String, roomName: String, requiredSession: Int? = null) {
         if (running.get()) { toast("Stop the current session first."); return }
         val pin = pinInput.text.toString().trim()
+        roomGroup = group
+        setRoomLabel("Room: $roomName ($group)")
         isHost = false
         hostAddress = null
         lostFrames.set(0)
@@ -878,7 +918,7 @@ class MainActivity : Activity() {
                 acquireMulticastLock()
                 val key = keyFor(pin)
                 guestKey = key // used later to encrypt my push-to-talk voice
-                val groupAddress = InetAddress.getByName(GROUP)
+                val groupAddress = InetAddress.getByName(group)
                 val sock = MulticastSocket(null)
                 udp = sock
                 sock.reuseAddress = true
@@ -906,6 +946,7 @@ class MainActivity : Activity() {
                 var activeSession = 0
                 var expectedSequence: Int? = null
                 var lockWarned = false
+                var qrWarned = false
                 var pinWarned = false
                 var receivingShown = false
                 sink.play()
@@ -933,6 +974,15 @@ class MainActivity : Activity() {
                     header.long // capture timestamp; reserved for latency diagnostics
                     val payloadLength = header.short.toInt() and 0xFFFF
                     if (version != VERSION || payloadLength <= 0 || payloadLength != packet.length - HEADER_SIZE) continue
+
+                    // QR join: ignore any broadcast other than the one the scanned QR code belongs to
+                    if (requiredSession != null && sessionId != requiredSession) {
+                        if (!qrWarned) {
+                            qrWarned = true
+                            setState("This QR code is old or for another broadcast. Scan the host's current QR code.")
+                        }
+                        continue
+                    }
 
                     val encrypted = (flags and FLAG_ENCRYPTED) != 0
                     if (encrypted != (key != null)) {
@@ -985,7 +1035,7 @@ class MainActivity : Activity() {
                 if (running.get()) setState("Receiver error: ${e.message ?: "unknown"}")
                 running.set(false)
             } finally {
-                try { udp?.leaveGroup(InetAddress.getByName(GROUP)) } catch (_: Exception) {}
+                try { udp?.leaveGroup(InetAddress.getByName(group)) } catch (_: Exception) {}
                 try { playout?.join(500) } catch (_: Exception) {}
                 try { output?.pause(); output?.flush(); output?.stop(); output?.release() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
@@ -1039,7 +1089,45 @@ class MainActivity : Activity() {
         runOnUiThread { qrImage.visibility = View.GONE }
         advertiser.stop()
         stopFindingSessions()
+        setRoomLabel("Room: not connected")
         setState("Stopped")
+    }
+
+    private fun setRoomLabel(text: String) {
+        runOnUiThread { roomView.text = text }
+    }
+
+    /**
+     * Each host gets its own multicast group derived from its Wi-Fi IP (192.168.1.23 -> 239.10.1.23).
+     * Two hosts can never pick the same group, and a guest can work it out from the host's address.
+     */
+    private fun groupForIp(ip: String?): String? {
+        val parts = ip?.split(".") ?: return null
+        if (parts.size != 4) return null
+        val third = parts[2].toIntOrNull()?.takeIf { it in 0..255 } ?: return null
+        val fourth = parts[3].toIntOrNull()?.takeIf { it in 0..255 } ?: return null
+        return "239.10.$third.$fourth"
+    }
+
+    /** Join a room, or switch to another one if already listening. */
+    private fun joinRoom(name: String, host: String, pinProtected: Boolean, requiredSession: Int? = null) {
+        if (isHost && running.get()) { toast("Stop broadcasting before joining another room."); return }
+        if (pinProtected && pinInput.text.toString().trim().isEmpty()) {
+            toast("This room has a PIN. Enter it first.")
+            return
+        }
+        val group = groupForIp(host)
+        if (group == null) { toast("Could not work out this room's address."); return }
+        if (running.get() && group == roomGroup && requiredSession == null) { toast("You are already in $name."); return }
+        toast("Joining $name…")
+        if (running.get()) {
+            // switching channels: close the old room completely, then open the new one
+            stopSession()
+            uiHandler.postDelayed({ if (!running.get()) startReceiver(group, name, requiredSession) }, 700)
+        } else {
+            stopFindingSessions()
+            startReceiver(group, name, requiredSession)
+        }
     }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
@@ -1047,7 +1135,7 @@ class MainActivity : Activity() {
     // ---------- find sessions nearby (network discovery) ----------
 
     private fun findSessions() {
-        if (running.get()) { toast("Stop the current session first."); return }
+        if (isHost && running.get()) { toast("Stop broadcasting first."); return }
         stopFindingSessions()
         sessionsBox.addView(TextView(this).apply {
             tag = "searching"
@@ -1070,15 +1158,9 @@ class MainActivity : Activity() {
         sessionsBox.findViewWithTag<View>("searching")?.let { sessionsBox.removeView(it) }
         val key = "$name@$host"
         if (sessionsBox.findViewWithTag<View>(key) != null) return // already listed
-        sessionsBox.addView(button("$name · $host" + if (pinProtected) " 🔒" else "") {
-            if (pinProtected && pinInput.text.toString().trim().isEmpty()) {
-                toast("This room has a PIN. Enter it first.")
-            } else {
-                stopFindingSessions()
-                toast("Joining $name…")
-                startReceiver()
-            }
-        }.also { it.tag = key })
+        val current = running.get() && !isHost && groupForIp(host) == roomGroup
+        val label = (if (current) "▶ " else "") + "$name · $host" + if (pinProtected) " 🔒" else ""
+        sessionsBox.addView(button(label) { joinRoom(name, host, pinProtected) }.also { it.tag = key })
     }
 
     // ---------- join by QR code ----------
@@ -1110,7 +1192,11 @@ class MainActivity : Activity() {
         val ip = localIpv4()
         if (ip == null) { toast("No Wi-Fi address found. Connect to Wi-Fi or turn on the hotspot."); return }
         try {
-            val bitmap = QrCodeGenerator.generateSessionUriQr(ip, PORT, 1, "SmartCast Session", 600, 600)
+            // The PIN is never in the QR. "sid" is this broadcast's random ID, so every session has its own QR.
+            val sid = Integer.toHexString(hostSessionId)
+            val uri = "smartcast://join?v=2&host=$ip&port=$PORT&room=${Uri.encode(hostRoomName)}" +
+                "&sid=$sid&pin=${if (hostHasPin) 1 else 0}"
+            val bitmap = qrBitmap(uri, 700)
             qrImage.setImageBitmap(bitmap)
             qrImage.visibility = View.VISIBLE
         } catch (e: Exception) {
@@ -1118,20 +1204,63 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Guest: scan the host's QR code with the camera, then join as a receiver. */
-    private fun scanJoinQr() {
-        if (running.get()) { toast("Stop the current session first."); return }
-        GmsBarcodeScanning.getClient(this).startScan()
-            .addOnSuccessListener { barcode ->
-                val config = barcode.rawValue?.let { SessionConnectionConfig.parse(it) }
-                if (config == null) {
-                    toast("That is not a SmartCast QR code.")
-                } else {
-                    toast("Joining ${config.sessionName}…")
-                    startReceiver() // enter the PIN first if the room has one
-                }
+    /** Draws a QR code bitmap with ZXing (works fully offline). */
+    private fun qrBitmap(text: String, size: Int): Bitmap {
+        val hints = mapOf<EncodeHintType, Any>(
+            EncodeHintType.MARGIN to 2,
+            EncodeHintType.CHARACTER_SET to "UTF-8"
+        )
+        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size, hints)
+        val pixels = IntArray(size * size)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                pixels[y * size + x] = if (matrix.get(x, y)) Color.BLACK else Color.WHITE
             }
-            .addOnFailureListener { e -> toast("Scanner unavailable: ${e.message ?: "unknown"}") }
+        }
+        return Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
+    }
+
+    /** Guest: open the camera (ZXing scanner, bundled in the app, no downloads) and scan the host's QR code. */
+    private fun scanJoinQr() {
+        if (isHost && running.get()) { toast("Stop broadcasting first."); return }
+        IntentIntegrator(this)
+            .setDesiredBarcodeFormats(IntentIntegrator.QR_CODE)
+            .setPrompt("Point the camera at the host's QR code")
+            .setBeepEnabled(false)
+            .setOrientationLocked(false)
+            .initiateScan()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        val result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
+        if (result != null) {
+            val text = result.contents
+            if (text == null) toast("Scan cancelled.") else handleScannedQr(text)
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    /** Reads smartcast://join?host=..&sid=..&room=..&pin=.. and joins that exact broadcast. */
+    private fun handleScannedQr(text: String) {
+        val uri = try { Uri.parse(text) } catch (_: Exception) { null }
+        if (uri == null || uri.scheme != "smartcast" || uri.host != "join") {
+            toast("That is not a SmartCast QR code.")
+            return
+        }
+        val host = uri.getQueryParameter("host")
+        val sid = uri.getQueryParameter("sid")?.takeIf { it.length in 1..8 }?.let {
+            try { it.toLong(16).toInt() } catch (_: Exception) { null }
+        }
+        if (host == null || sid == null) {
+            toast("This QR code is incomplete or from an older version.")
+            return
+        }
+        val name = (uri.getQueryParameter("room") ?: "SmartCast Session").take(40)
+        val pinProtected = uri.getQueryParameter("pin") == "1"
+        joinRoom(name, host, pinProtected, sid) // enter the PIN first if the room has one
     }
 
     override fun onDestroy() {
