@@ -10,22 +10,23 @@ import io.github.jaredmdobson.concentus.OpusEncoder
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.crypto.SecretKey
 import kotlin.concurrent.thread
 
 /**
- * Guest-side push to talk. Records the mic, encodes 20 ms Opus frames, encrypts each one
- * with AES-GCM (PttSender) and sends it to the host. Wire format per datagram:
- * [seq(2) ts(4) ch(1) flags(1) sessionId(4)][ciphertext][tag(16)].
- * The sessionId is assigned by the host when it approves this guest's hand raise.
+ * Guest-side push to talk. Records the mic, encodes 20 ms Opus frames and sends them to the host.
+ *
+ * - PIN room: pass the [PttSender] created when the host approved this guest. Every frame is
+ *   AES-GCM encrypted. The SAME sender must be reused for every press during one approval,
+ *   so sequence numbers never restart (restarting would reuse GCM nonces).
+ * - Open room (no PIN): pass null and frames go out as [8 bytes clientId][opus payload].
  */
 class PushToTalkController(
     private val hostIp: String,
     private val pttPort: Int,
-    private val sessionId: Int,
-    private val roomKey: SecretKey,
-    private val channelId: Byte,
+    private val clientId: Long,
+    private val sender: PttSender?,
     private val onError: (String) -> Unit = {}
 ) {
     companion object {
@@ -69,9 +70,6 @@ class PushToTalkController(
                 val address = InetAddress.getByName(hostIp)
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val opus = ByteArray(MAX_OPUS_BYTES)
-
-                // One sender per transmission: sequence numbers restart at 0 with the session ID.
-                val sender = PttSender(roomKey, sessionId, channelId)
                 var timestamp = 0L
 
                 mic.startRecording()
@@ -85,7 +83,14 @@ class PushToTalkController(
                     if (!active.get()) break
                     val length = encoder.encode(pcm, 0, FRAME_SAMPLES, opus, 0, opus.size)
                     if (length > 0) {
-                        val bytes = sender.seal(opus.copyOf(length), timestamp)
+                        val bytes = if (sender != null) {
+                            sender.seal(opus.copyOf(length), timestamp)
+                        } else {
+                            val out = ByteBuffer.allocate(8 + length)
+                            out.putLong(clientId)
+                            out.put(opus, 0, length)
+                            out.array()
+                        }
                         sock.send(DatagramPacket(bytes, bytes.size, address, pttPort))
                     }
                     timestamp = (timestamp + FRAME_SAMPLES) and 0xFFFFFFFFL
