@@ -1,4 +1,4 @@
-package com.gitco.smartcast.discovery
+package com.smartcast.live.discovery
 
 import android.content.Context
 import android.net.nsd.NsdManager
