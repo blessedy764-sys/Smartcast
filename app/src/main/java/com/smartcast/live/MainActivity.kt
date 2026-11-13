@@ -21,6 +21,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -29,6 +30,9 @@ import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
 import com.smartcast.live.network.PttReceiver
 import com.smartcast.live.network.PttSender
+import com.smartcast.live.qr.QrCodeGenerator
+import com.smartcast.live.qr.SessionConnectionConfig
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.smartcast.live.room.ClientTracker
 import com.smartcast.live.security.RoomSecurity
 import com.smartcast.live.service.SmartCastAudioService
@@ -40,8 +44,10 @@ import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.MulticastSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -123,6 +129,7 @@ class MainActivity : Activity() {
     private lateinit var handButton: Button
     private lateinit var talkButton: Button
     private lateinit var requestsBox: LinearLayout
+    private lateinit var qrImage: ImageView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -191,6 +198,14 @@ class MainActivity : Activity() {
         page.addView(button("Start broadcasting") { startHost() })
         page.addView(button("Join as receiver") { startReceiver() })
         page.addView(button("Stop session") { stopSession() })
+        page.addView(button("Show join QR code") { showJoinQr() })
+        page.addView(button("Scan QR code to join") { scanJoinQr() })
+        qrImage = ImageView(this).apply {
+            visibility = View.GONE
+            adjustViewBounds = true
+            setPadding(0, 16, 0, 16)
+        }
+        page.addView(qrImage)
 
         // ---- Room: participants + hand raise ----
         page.addView(section("ROOM"))
@@ -931,10 +946,64 @@ class MainActivity : Activity() {
         handStatus = HAND_IDLE
         updateHandUi()
         refreshRoomUi()
+        runOnUiThread { qrImage.visibility = View.GONE }
         setState("Stopped")
     }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+
+    // ---------- join by QR code ----------
+
+    /** This phone's IPv4 address on Wi-Fi or hotspot (hotspot interfaces are named ap/swlan on most phones). */
+    private fun localIpv4(): String? {
+        val found = mutableListOf<Pair<String, String>>() // interface name to IPv4 address
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+        for (nif in interfaces) {
+            if (!nif.isUp || nif.isLoopback) continue
+            for (addr in nif.inetAddresses) {
+                val ip = addr.hostAddress
+                if (addr is Inet4Address && ip != null) found.add(Pair(nif.name, ip))
+            }
+        }
+        val wifiLike = found.firstOrNull { (name, _) ->
+            name.startsWith("wlan") || name.startsWith("ap") || name.startsWith("swlan")
+        }
+        return (wifiLike ?: found.firstOrNull())?.second
+    }
+
+    /** Host: show a QR code that guests scan to join. The PIN is never put in the QR code. */
+    private fun showJoinQr() {
+        if (qrImage.visibility == View.VISIBLE) {
+            qrImage.visibility = View.GONE
+            return
+        }
+        if (!running.get() || !isHost) { toast("Start broadcasting first."); return }
+        val ip = localIpv4()
+        if (ip == null) { toast("No Wi-Fi address found. Connect to Wi-Fi or turn on the hotspot."); return }
+        try {
+            val bitmap = QrCodeGenerator.generateSessionUriQr(ip, PORT, 1, "SmartCast Session", 600, 600)
+            qrImage.setImageBitmap(bitmap)
+            qrImage.visibility = View.VISIBLE
+        } catch (e: Exception) {
+            toast("Could not create the QR code.")
+        }
+    }
+
+    /** Guest: scan the host's QR code with the camera, then join as a receiver. */
+    private fun scanJoinQr() {
+        if (running.get()) { toast("Stop the current session first."); return }
+        GmsBarcodeScanning.getClient(this).startScan()
+            .addOnSuccessListener { barcode ->
+                val config = barcode.rawValue?.let { SessionConnectionConfig.parse(it) }
+                if (config == null) {
+                    toast("That is not a SmartCast QR code.")
+                } else {
+                    toast("Joining ${config.sessionName}…")
+                    startReceiver() // enter the PIN first if the room has one
+                }
+            }
+            .addOnFailureListener { e -> toast("Scanner unavailable: ${e.message ?: "unknown"}") }
+    }
 
     override fun onDestroy() {
         stopSession()
