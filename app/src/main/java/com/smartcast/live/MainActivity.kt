@@ -27,6 +27,8 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
+import com.smartcast.live.network.PttReceiver
+import com.smartcast.live.network.PttSender
 import com.smartcast.live.room.ClientTracker
 import com.smartcast.live.security.RoomSecurity
 import com.smartcast.live.service.SmartCastAudioService
@@ -43,6 +45,7 @@ import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -70,6 +73,7 @@ class MainActivity : Activity() {
         private const val MAX_OPUS_BYTES = 1275
         private const val REQUEST_MIC = 41
         private const val FLAG_ENCRYPTED = 1
+        private const val PTT_CHANNEL: Byte = 1
         private val ROOM_SALT = "SmartCastRoomSalt-v1".toByteArray()
         private const val HAND_IDLE = "Hand raise: join as a receiver to ask to speak"
     }
@@ -102,6 +106,13 @@ class MainActivity : Activity() {
     @Volatile private var activeSpeaker: Long? = null // host: the one approved guest we play
     private var pttController: PushToTalkController? = null
     private val guestFrames = ConcurrentLinkedQueue<ShortArray>() // decoded guest voice, mixed into the broadcast
+
+    // encrypted push to talk (PIN rooms only; open rooms keep the plain [clientId][opus] format)
+    @Volatile private var pttReceiver: PttReceiver? = null   // host: validates and decrypts guest voice
+    @Volatile private var activeSessionId = 0                // host: PTT session of the approved guest (0 = none)
+    private var lastPttSessionId = SecureRandom().nextInt()  // host: random start, then increments
+    @Volatile private var guestKey: SecretKeySpec? = null    // guest: room key from my PIN
+    @Volatile private var pttSender: PttSender? = null       // guest: one sender per approval, reused on every press
 
     private lateinit var status: TextView
     private lateinit var banner: TextView
@@ -373,12 +384,26 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Host: forget the current speaker and close their encrypted PTT session. */
+    private fun endActiveSpeaker() {
+        val sessionId = activeSessionId
+        if (sessionId != 0) pttReceiver?.closeSession(sessionId)
+        activeSessionId = 0
+        activeSpeaker = null
+    }
+
+    /** Host: next PTT session ID (never 0, never repeated while the process runs). */
+    private fun nextPttSessionId(): Int {
+        do { lastPttSessionId++ } while (lastPttSessionId == 0)
+        return lastPttSessionId
+    }
+
     private fun onHostHandPacket(msg: HandRaisePacket, address: String) {
         when (msg.action) {
             HandRaiseAction.REQUEST -> handRequests[msg.clientId] = address
             HandRaiseAction.RELEASE, HandRaiseAction.DENY -> {
                 handRequests.remove(msg.clientId)
-                if (activeSpeaker == msg.clientId) activeSpeaker = null
+                if (activeSpeaker == msg.clientId) endActiveSpeaker()
             }
             HandRaiseAction.APPROVE -> {}
         }
@@ -389,11 +414,15 @@ class MainActivity : Activity() {
         if (msg.clientId != myClientId) return
         when (msg.action) {
             HandRaiseAction.APPROVE -> {
+                // PIN room: build one sender for this whole approval (the host assigned the session ID).
+                val key = guestKey
+                pttSender = if (key != null && msg.sessionId != 0) PttSender(key, msg.sessionId, PTT_CHANNEL) else null
                 approved = true
                 handStatus = "✅ Approved. Hold the button to talk."
             }
             HandRaiseAction.DENY -> {
                 approved = false
+                pttSender = null
                 stopTalking()
                 handRaised = false
                 handStatus = "Hand lowered by host"
@@ -410,6 +439,7 @@ class MainActivity : Activity() {
         handRaised = !handRaised
         if (!handRaised) {
             approved = false
+            pttSender = null
             stopTalking()
         }
         handStatus = if (handRaised) "✋ Hand raised. Waiting for the host." else "Hand lowered"
@@ -443,8 +473,12 @@ class MainActivity : Activity() {
                         isAllCaps = false
                         setOnClickListener {
                             handRequests.remove(id)
+                            endActiveSpeaker() // close the previous speaker's session first
+                            val receiver = pttReceiver
+                            val sessionId = if (receiver != null) nextPttSessionId().also { receiver.openSession(it) } else 0
+                            activeSessionId = sessionId
                             activeSpeaker = id
-                            sendHand(addr, HandRaisePacket(id, HandRaiseAction.APPROVE))
+                            sendHand(addr, HandRaisePacket(id, HandRaiseAction.APPROVE, sessionId))
                             refreshRoomUi()
                         }
                     })
@@ -494,8 +528,13 @@ class MainActivity : Activity() {
             return
         }
         val host = hostAddress ?: return
+        val sender = pttSender
+        if (guestKey != null && sender == null) {
+            setState("Talk unavailable: host did not send a session ID")
+            return
+        }
         pttController?.stopTransmitting()
-        pttController = PushToTalkController(host, PTT_PORT, myClientId) { message ->
+        pttController = PushToTalkController(host, PTT_PORT, myClientId, sender) { message ->
             setState("Talk error: $message")
         }.also { it.startTransmitting() }
         track?.setVolume(0f) // do not play my own voice back to me with a delay
@@ -511,10 +550,14 @@ class MainActivity : Activity() {
     }
 
     /** Host: decode and play voice from the approved guest only. */
-    private fun startPttListener() {
+    private fun startPttListener(pin: String) {
         thread(name = "SmartCastPttReceive") {
             var sink: AudioTrack? = null
             try {
+                // PIN room: only accept encrypted packets from the approved session.
+                // Open room: keep the legacy [clientId][opus] format.
+                val receiver = keyFor(pin)?.let { PttReceiver(it) }
+                pttReceiver = receiver
                 val s = openUdp(PTT_PORT)
                 val minBuffer = AudioTrack.getMinBufferSize(
                     SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
@@ -536,10 +579,25 @@ class MainActivity : Activity() {
                 while (running.get()) {
                     val p = DatagramPacket(buf, buf.size)
                     s.receive(p)
-                    if (p.length <= 8) continue
-                    val id = ByteBuffer.wrap(p.data, p.offset, 8).long
-                    if (id != activeSpeaker) continue
-                    val samples = decoder.decode(p.data, p.offset + 8, p.length - 8, pcmOut, 0, pcmOut.size, false)
+                    val opusData: ByteArray
+                    val opusOffset: Int
+                    val opusLength: Int
+                    if (receiver != null) {
+                        // Drops unknown sessions, bad tags and replays. Only the approved guest has an open session.
+                        val packet = receiver.receive(p.data, p.length) ?: continue
+                        opusData = packet.opusPayload
+                        opusOffset = 0
+                        opusLength = packet.opusPayload.size
+                    } else {
+                        if (p.length <= 8) continue
+                        val id = ByteBuffer.wrap(p.data, p.offset, 8).long
+                        if (id != activeSpeaker) continue
+                        opusData = p.data
+                        opusOffset = p.offset + 8
+                        opusLength = p.length - 8
+                    }
+                    if (opusLength <= 0) continue
+                    val samples = decoder.decode(opusData, opusOffset, opusLength, pcmOut, 0, pcmOut.size, false)
                     if (samples > 0) {
                         out.write(pcmOut, 0, samples) // the host hears the guest
                         guestFrames.add(pcmOut.copyOf(samples)) // and it is mixed into the broadcast
@@ -586,6 +644,8 @@ class MainActivity : Activity() {
         isHost = true
         tracker.clear()
         handRequests.clear()
+        pttReceiver = null
+        activeSessionId = 0
         activeSpeaker = null
         guestFrames.clear()
         running.set(true)
@@ -593,7 +653,7 @@ class MainActivity : Activity() {
         startHealthMonitoring()
         startHostListeners()
         startHandListener()
-        startPttListener()
+        startPttListener(pin)
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
         thread(name = "SmartCastOpusHost") {
@@ -703,6 +763,8 @@ class MainActivity : Activity() {
         totalFrames.set(0)
         handRaised = false
         approved = false
+        guestKey = null
+        pttSender = null
         handStatus = "Hand raise: tap to ask to speak"
         updateHandUi()
         running.set(true)
@@ -716,6 +778,7 @@ class MainActivity : Activity() {
             try {
                 acquireMulticastLock()
                 val key = keyFor(pin)
+                guestKey = key // used later to encrypt my push-to-talk voice
                 val groupAddress = InetAddress.getByName(GROUP)
                 val sock = MulticastSocket(null)
                 udp = sock
@@ -856,7 +919,10 @@ class MainActivity : Activity() {
         track = null
         socket = null
         handRequests.clear()
-        activeSpeaker = null
+        endActiveSpeaker()
+        pttReceiver = null
+        pttSender = null
+        guestKey = null
         guestFrames.clear()
         approved = false
         tracker.clear()
