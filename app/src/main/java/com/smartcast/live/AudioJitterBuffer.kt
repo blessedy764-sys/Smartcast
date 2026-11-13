@@ -1,91 +1,91 @@
-package com.gitco.smartcast.audio
+package com.smartcast.live.audio
 
-import com.gitco.smartcast.network.SmartCastPacket
-import java.util.concurrent.ConcurrentHashMap
+import io.github.jaredmdobson.concentus.OpusDecoder
+import java.util.concurrent.atomic.AtomicLong
 
 class AudioJitterBuffer(
-    private val targetBufferFrames: Int = 3, // 3 * 20ms = 60ms latency
-    private val maxBufferFrames: Int = 12    // 240ms cap to prevent runaway delay
+    private val targetBufferFrames: Int = 3,  // 3 x 20 ms = 60 ms
+    private val maxBufferFrames: Int = 12,    // 240 ms cap
+    private val maxConcealFrames: Int = 5     // then wait for fresh audio
 ) {
-    private val packetMap = ConcurrentHashMap<Int, SmartCastPacket>()
-    private var nextPlaySeq: Int = -1
-    private var isBuffering: Boolean = true
+    private val lock = Any()
+    private val packets = HashMap<Int, ByteArray>()
+    private var hasSeq = false
+    private var nextSeq = 0
+    private var buffering = true
+    private var concealed = 0
 
-    // Telemetry counters for your UI diagnostics
-    var packetsReceived: Long = 0L
-        private set
-    var packetsLost: Long = 0L
-        private set
-    var fecRecovered: Long = 0L
-        private set
+    private val received = AtomicLong()
+    private val lost = AtomicLong()
+    private val recovered = AtomicLong()
+    val packetsReceived: Long get() = received.get()
+    val packetsLost: Long get() = lost.get()
+    val fecRecovered: Long get() = recovered.get()
 
-    fun push(packet: SmartCastPacket) {
-        packetsReceived++
-        val seq = packet.sequenceNumber
-
-        if (nextPlaySeq == -1) {
-            nextPlaySeq = seq
-        }
-
-        // Drop packets that arrived too late (accounting for 16-bit wrap-around)
-        if (seqDiff(seq, nextPlaySeq) < 0) return
-
-        // Prevent buffer bloat if Wi-Fi stalls and dumps a burst
-        if (packetMap.size >= maxBufferFrames) {
-            packetMap.clear()
-            nextPlaySeq = seq
-            isBuffering = true
-        }
-
-        packetMap[seq] = packet
-
-        if (isBuffering && packetMap.size >= targetBufferFrames) {
-            isBuffering = false
+    /** Network thread: add one decrypted Opus payload. */
+    fun push(sequence: Int, opus: ByteArray) {
+        received.incrementAndGet()
+        synchronized(lock) {
+            if (!hasSeq) { nextSeq = sequence; hasSeq = true }
+            val ahead = sequence - nextSeq // signed difference
+            if (ahead < 0) return          // too late, already played
+            if (ahead > maxBufferFrames || packets.size >= maxBufferFrames) {
+                // sender jumped or a burst arrived: restart around this packet
+                packets.clear()
+                nextSeq = sequence
+                buffering = true
+                concealed = 0
+            }
+            packets[sequence] = opus
+            if (buffering && packets.size >= targetBufferFrames) buffering = false
         }
     }
 
     /**
-     * Called every 20ms by the AudioTrack playback loop.
-     * Returns decoded 16-bit PCM samples (or null while initial buffer fills).
+     * Playback thread: decode the next 20 ms frame into [out].
+     * Returns the sample count, or 0 while buffering.
      */
-    fun popAndDecode(
-        decoderPtr: Long,
-        frameSize: Int,
-        decodeFn: (Long, ByteArray?, Int, Boolean) -> ShortArray?
-    ): ShortArray? {
-        if (isBuffering) return null
-
-        val currentPacket = packetMap.remove(nextPlaySeq)
-        if (currentPacket != null) {
-            nextPlaySeq = (nextPlaySeq + 1) and 0xFFFF
-            return decodeFn(decoderPtr, currentPacket.opusPayload, frameSize, false)
+    fun popAndDecode(decoder: OpusDecoder, out: ShortArray, frameSize: Int): Int {
+        var payload: ByteArray? = null
+        var useFec = false
+        synchronized(lock) {
+            if (buffering || !hasSeq) return 0
+            val current = packets.remove(nextSeq)
+            if (current != null) {
+                payload = current
+                concealed = 0
+            } else if (packets.isEmpty()) {
+                if (++concealed > maxConcealFrames) {
+                    // sender paused or link dropped: re-sync instead of concealing forever
+                    hasSeq = false
+                    buffering = true
+                    concealed = 0
+                    return 0
+                }
+                lost.incrementAndGet() // plain concealment
+            } else {
+                val next = packets[nextSeq + 1]
+                if (next != null) {
+                    payload = next      // recover the lost frame from FEC data
+                    useFec = true
+                    recovered.incrementAndGet()
+                } else {
+                    lost.incrementAndGet()
+                }
+            }
+            nextSeq++
         }
-
-        // Current packet is missing! Check if next packet (seq + 1) arrived for In-Band FEC
-        val lookaheadSeq = (nextPlaySeq + 1) and 0xFFFF
-        val nextPacket = packetMap[lookaheadSeq]
-        nextPlaySeq = lookaheadSeq
-
-        return if (nextPacket != null) {
-            fecRecovered++
-            // Recover the missing frame using FEC data embedded inside nextPacket
-            decodeFn(decoderPtr, nextPacket.opusPayload, frameSize, true)
-        } else {
-            packetsLost++
-            // Both missing -> Run Opus PLC (pass null payload)
-            decodeFn(decoderPtr, null, frameSize, false)
-        }
+        return try {
+            decoder.decode(payload, 0, payload?.size ?: 0, out, 0, frameSize, useFec)
+        } catch (e: Exception) { 0 }
     }
 
     fun reset() {
-        packetMap.clear()
-        nextPlaySeq = -1
-        isBuffering = true
+        synchronized(lock) {
+            packets.clear()
+            hasSeq = false
+            buffering = true
+            concealed = 0
+        }
     }
-
-    /** Signed circular difference for 16-bit sequence numbers (0..65535). */
-    private fun seqDiff(a: Int, b: Int): Int {
-        val diff = (a - b) and 0xFFFF
-        return if (diff > 32767) diff - 65536 else diff
-    }
-}
+} 
