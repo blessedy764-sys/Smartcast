@@ -29,6 +29,9 @@ import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
 import com.smartcast.live.audio.AudioJitterBuffer
+import com.smartcast.live.chat.ChatCodec
+import com.smartcast.live.chat.ChatMessage
+import com.smartcast.live.chat.LiveChatView
 import com.smartcast.live.discovery.SmartCastAdvertiser
 import com.smartcast.live.discovery.SmartCastDiscovery
 import com.smartcast.live.network.PttReceiver
@@ -72,6 +75,7 @@ class MainActivity : Activity() {
         private const val TELEMETRY_PORT = 50006 // guests -> host heartbeats
         private const val HAND_PORT = 50007      // hand raise requests and replies
         private const val PTT_PORT = 50008       // approved guest voice -> host
+        private const val CHAT_PORT = 50009      // live chat + reactions (multicast, everyone <-> everyone)
         private const val SAMPLE_RATE = 48_000
         private const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
         private const val BITRATE = 32_000
@@ -134,6 +138,9 @@ class MainActivity : Activity() {
     private lateinit var requestsBox: LinearLayout
     private lateinit var qrImage: ImageView
     private lateinit var sessionsBox: LinearLayout
+    private lateinit var chatView: LiveChatView
+    @Volatile private var chatSocket: MulticastSocket? = null
+    @Volatile private var chatKey: SecretKeySpec? = null
     private val advertiser by lazy { SmartCastAdvertiser(applicationContext) } // host: announce the session
     private var discovery: SmartCastDiscovery? = null                         // guest: look for sessions
 
@@ -246,6 +253,11 @@ class MainActivity : Activity() {
         page.addView(talkButton)
         requestsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(requestsBox)
+
+        // ---- Live chat ----
+        page.addView(section("LIVE CHAT"))
+        chatView = LiveChatView(this).apply { onSend = { text, reaction -> sendChat(text, reaction) } }
+        page.addView(chatView)
 
         page.addView(section("SMARTCAST INTERPRETER"))
         page.addView(TextView(this).apply {
@@ -542,6 +554,61 @@ class MainActivity : Activity() {
         runOnUiThread { participantsView.text = "Connected to host $address" }
     }
 
+    // ---------- live chat ----------
+
+    /** Everyone (host and guests) joins the chat multicast group and listens for messages. */
+    private fun startChat(pin: String) {
+        chatView.clear()
+        thread(name = "SmartCastChat") {
+            var sock: MulticastSocket? = null
+            try {
+                acquireMulticastLock()
+                val key = keyFor(pin)
+                chatKey = key
+                val s = MulticastSocket(null)
+                sock = s
+                s.reuseAddress = true
+                s.bind(InetSocketAddress(CHAT_PORT))
+                s.joinGroup(InetAddress.getByName(GROUP))
+                auxSockets.add(s) // closed by stopSession
+                chatSocket = s
+                val buf = ByteArray(1024)
+                while (running.get()) {
+                    val p = DatagramPacket(buf, buf.size)
+                    s.receive(p)
+                    val msg = ChatCodec.decode(p.data, p.length, key) ?: continue
+                    if (msg.senderId == myClientId) continue // my own message is already on screen
+                    runOnUiThread {
+                        chatView.addMessage(
+                            if (msg.isHost) "HOST" else label(msg.senderId),
+                            msg.isHost, msg.text, msg.isReaction
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                chatSocket = null
+                try { sock?.leaveGroup(InetAddress.getByName(GROUP)) } catch (_: Exception) {}
+                try { sock?.close() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /** Shows the message on this phone immediately, then broadcasts it to everyone else. */
+    private fun sendChat(text: String, reaction: Boolean) {
+        val clean = text.trim().take(ChatCodec.MAX_CHARS)
+        if (clean.isEmpty()) return
+        if (!running.get()) { toast("Start or join a session first."); return }
+        chatView.addMessage(if (isHost) "HOST" else label(myClientId), isHost, clean, reaction)
+        val s = chatSocket ?: return
+        val bytes = ChatCodec.encode(ChatMessage(myClientId, isHost, reaction, clean), chatKey)
+        thread(name = "SmartCastChatSend") {
+            try {
+                s.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(GROUP), CHAT_PORT))
+            } catch (_: Exception) {}
+        }
+    }
+
     // ---------- push to talk ----------
 
     /** Guest: start sending my mic to the host while the button is held (only when approved). */
@@ -678,6 +745,7 @@ class MainActivity : Activity() {
         startHostListeners()
         startHandListener()
         startPttListener(pin)
+        startChat(pin)
         advertiser.start(PORT, "SmartCast Session", pin.isNotEmpty())
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
@@ -800,6 +868,7 @@ class MainActivity : Activity() {
         startAudioService(false)
         startHealthMonitoring()
         startHandListener()
+        startChat(pin)
         setState("Searching for Opus broadcast…")
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
@@ -957,6 +1026,9 @@ class MainActivity : Activity() {
         pttSender = null
         guestKey = null
         guestFrames.clear()
+        chatSocket = null
+        chatKey = null
+        runOnUiThread { chatView.clear() }
         approved = false
         tracker.clear()
         hostAddress = null
