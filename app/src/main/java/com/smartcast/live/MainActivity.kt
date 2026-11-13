@@ -28,6 +28,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
+import com.smartcast.live.audio.AudioJitterBuffer
 import com.smartcast.live.discovery.SmartCastAdvertiser
 import com.smartcast.live.discovery.SmartCastDiscovery
 import com.smartcast.live.network.PttReceiver
@@ -703,6 +704,10 @@ class MainActivity : Activity() {
                 val encoder = OpusEncoder(SAMPLE_RATE, 1, OpusApplication.OPUS_APPLICATION_VOIP)
                 encoder.setBitrate(BITRATE)
                 encoder.setComplexity(5)
+                // In-band FEC: each packet carries a low-bitrate copy of the previous frame,
+                // so the receiver's jitter buffer can recover a single lost packet.
+                encoder.setUseInbandFEC(true)
+                encoder.setPacketLossPercent(10)
                 var currentBitrate = BITRATE
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
@@ -799,6 +804,7 @@ class MainActivity : Activity() {
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
             var output: AudioTrack? = null
+            var playout: Thread? = null
             try {
                 acquireMulticastLock()
                 val key = keyFor(pin)
@@ -826,6 +832,7 @@ class MainActivity : Activity() {
                 track = sink
                 val decoder = OpusDecoder(SAMPLE_RATE, 1)
                 val pcmOut = ShortArray(5760) // Opus maximum frame: 120 ms at 48 kHz
+                val jitter = AudioJitterBuffer() // 60 ms target, 240 ms cap, FEC + concealment
                 val receiveBuffer = ByteArray(HEADER_SIZE + MAX_OPUS_BYTES + 64)
                 var activeSession = 0
                 var expectedSequence: Int? = null
@@ -833,6 +840,16 @@ class MainActivity : Activity() {
                 var pinWarned = false
                 var receivingShown = false
                 sink.play()
+                // Playout thread: decodes one 20 ms frame at a time from the jitter buffer.
+                // sink.write blocks, which paces this loop to real time.
+                playout = thread(name = "SmartCastPlayout") {
+                    try {
+                        while (running.get()) {
+                            val n = jitter.popAndDecode(decoder, pcmOut, FRAME_SAMPLES)
+                            if (n > 0) sink.write(pcmOut, 0, n) else Thread.sleep(5)
+                        }
+                    } catch (_: Exception) {}
+                }
                 setState("Receiving and decoding Opus audio")
                 while (running.get()) {
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
@@ -863,10 +880,10 @@ class MainActivity : Activity() {
                     if (activeSession != sessionId) {
                         activeSession = sessionId
                         expectedSequence = sequence
+                        jitter.reset() // a new host session restarts sequence numbers at 0
                     }
                     val expected = expectedSequence ?: sequence
-                    val gap = sequence - expected
-                    if (gap < 0) continue // late or duplicate packet
+                    val gap = sequence - expected // negative = reordered; the jitter buffer decides
 
                     val raw = packet.data.copyOfRange(
                         packet.offset + HEADER_SIZE, packet.offset + HEADER_SIZE + payloadLength
@@ -882,21 +899,12 @@ class MainActivity : Activity() {
                     } else raw
                     if (opus == null) continue
 
-                    lostFrames.addAndGet(gap)
-                    totalFrames.addAndGet(gap + 1)
-                    // Opus is stateful: conceal missing 20 ms frames before decoding the next packet.
-                    if (gap in 1..5) {
-                        for (i in 1..gap) {
-                            val concealed = decoder.decode(null, 0, 0, pcmOut, 0, FRAME_SAMPLES, false)
-                            if (concealed > 0) sink.write(pcmOut, 0, concealed)
-                        }
+                    if (gap >= 0) {
+                        lostFrames.addAndGet(gap)
+                        totalFrames.addAndGet(gap + 1)
+                        expectedSequence = sequence + 1
                     }
-                    val decodedSamples = decoder.decode(
-                        opus, 0, opus.size,
-                        pcmOut, 0, pcmOut.size, false
-                    )
-                    if (decodedSamples > 0) sink.write(pcmOut, 0, decodedSamples)
-                    expectedSequence = sequence + 1
+                    jitter.push(sequence, opus)
 
                     if (hostAddress == null) onHostFound(packet.address.hostAddress ?: "")
                     if (!receivingShown) {
@@ -909,6 +917,7 @@ class MainActivity : Activity() {
                 running.set(false)
             } finally {
                 try { udp?.leaveGroup(InetAddress.getByName(GROUP)) } catch (_: Exception) {}
+                try { playout?.join(500) } catch (_: Exception) {}
                 try { output?.pause(); output?.flush(); output?.stop(); output?.release() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
                 track = null
