@@ -33,7 +33,7 @@ android {
 dependencies {
     implementation("io.github.jaredmdobson:concentus:1.0.2")
     implementation("com.google.zxing:core:3.5.3")
-    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
