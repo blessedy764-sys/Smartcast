@@ -3,6 +3,9 @@ package com.smartcast.live
 import com.smartcast.live.qa.HandRaiseAction
 import com.smartcast.live.qa.HandRaisePacket
 import com.smartcast.live.qa.PushToTalkController
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
