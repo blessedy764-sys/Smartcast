@@ -12,8 +12,8 @@ android {
         applicationId = "com.smartcast.live"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0-prototype"
+        versionCode = 3
+        versionName = "0.3.0-prototype"
     }
 
     compileOptions {
@@ -21,17 +21,20 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 dependencies {
     implementation("io.github.jaredmdobson:concentus:1.0.2")
+    implementation("cn.enaium.rnnoise:rnnoise-kmp:1.0.2")
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
