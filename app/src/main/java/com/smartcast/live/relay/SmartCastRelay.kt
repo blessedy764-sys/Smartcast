@@ -30,7 +30,7 @@ import kotlin.concurrent.thread
  *    (so PIN rooms keep working: the relay never decrypts anything).
  *  - Up (guests -> host): heartbeats, poll answers, hand raises and push-to-talk are passed to the host.
  *    Host replies to hand raises are routed back to the right guest by client ID.
- *  - Chat is bridged both ways.
+ *  - Chat is bridged both ways. Packets are only forwarded away from the side they came from, so nothing loops.
  */
 class SmartCastRelay(
     context: Context,
@@ -64,10 +64,17 @@ class SmartCastRelay(
     @Volatile private var ssid = ""
     @Volatile private var password = ""
     @Volatile private var relayIp = ""
+    @Volatile private var stationIp = ""
+    @Volatile private var apIp = ""
+    @Volatile private var apPrefix = ""
 
     @Suppress("DEPRECATION")
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        if (wifiNetwork() == null) {
+            fail("Connect this phone to the host's Wi-Fi first, then start the relay.")
+            return
+        }
         val wifi = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         try {
             multicastLock = wifi.createMulticastLock("SmartCastRelayMulticast").apply {
@@ -95,7 +102,7 @@ class SmartCastRelay(
                 }
             }, Handler(Looper.getMainLooper()))
         } catch (e: SecurityException) {
-            fail("Permission missing for the relay hotspot. Allow it and try again.")
+            fail("The hotspot needs the permission allowed and Location turned on in phone settings. Fix that and try again.")
         } catch (e: Exception) {
             fail("Could not start the relay hotspot: ${e.message ?: "unknown"}")
         }
@@ -123,6 +130,7 @@ class SmartCastRelay(
 
     private fun failText(reason: Int): String = when (reason) {
         1 -> "No free Wi-Fi channel for the relay hotspot."
+        2 -> "Could not start the hotspot. Turn on Location in phone settings and try again."
         3 -> "The hotspot can't start right now. Turn off the normal hotspot and Wi-Fi Direct, then try again."
         4 -> "Hotspots are turned off on this phone."
         else -> "Could not start the relay hotspot (code $reason)."
@@ -134,11 +142,14 @@ class SmartCastRelay(
             ssid = creds.first
             password = creds.second
 
+            val wifiNet = wifiNetwork()
+            val stationName = wifiInterfaceName(wifiNet)
+
             // The hotspot interface can take a moment to get its address.
             var found: Pair<Pair<NetworkInterface, Inet4Address>, Pair<NetworkInterface, Inet4Address>>? = null
             for (attempt in 0 until 12) {
                 if (!running.get()) return
-                found = findInterfaces()
+                found = findInterfaces(stationName)
                 if (found != null) break
                 Thread.sleep(500)
             }
@@ -146,10 +157,11 @@ class SmartCastRelay(
                 "Could not find both networks. This phone may not support Wi-Fi and hotspot at the same time."
             )
             val stationIf = station.first
-            val stationIp = station.second.hostAddress ?: ""
             val apIf = ap.first
-            val apIp = ap.second.hostAddress ?: ""
-            if (stationIp.substringBeforeLast('.') == apIp.substringBeforeLast('.')) {
+            stationIp = station.second.hostAddress ?: ""
+            apIp = ap.second.hostAddress ?: ""
+            apPrefix = apIp.substringBeforeLast('.')
+            if (stationIp.substringBeforeLast('.') == apPrefix) {
                 throw IllegalStateException("The relay hotspot landed on the same network range as the host. Stop and start the relay again.")
             }
             val hostGroup = groupForIp(hostIp) ?: throw IllegalStateException("Bad host address")
@@ -159,22 +171,21 @@ class SmartCastRelay(
             }
             relayIp = apIp
 
-            val wifiNet = wifiNetwork()
             val hostAddr = InetAddress.getByName(hostIp)
             val hostGroupAddr = InetAddress.getByName(hostGroup)
             val guestGroupAddr = InetAddress.getByName(guestGroup)
 
-            // senders (loopback off so the relay never hears its own forwarded packets)
+            // senders
             val apSender = MulticastSocket().also {
                 it.timeToLive = 1
                 it.setNetworkInterface(apIf)
-                it.setLoopbackMode(true)
+                try { it.setLoopbackMode(true) } catch (_: Exception) {}
                 sockets.add(it)
             }
             val stationSender = MulticastSocket().also {
                 it.timeToLive = 1
                 it.setNetworkInterface(stationIf)
-                it.setLoopbackMode(true)
+                try { it.setLoopbackMode(true) } catch (_: Exception) {}
                 try { wifiNet?.bindSocket(it) } catch (_: Exception) {}
                 sockets.add(it)
             }
@@ -186,31 +197,32 @@ class SmartCastRelay(
 
             // host -> guests: audio + polls (the session ID is read from the audio header for the join QR)
             pump("SmartCastRelayAudio", multicastReceiver(hostGroupAddr, PORT, stationIf)) { p ->
-                if (p.length >= 10 && ByteBuffer.wrap(p.data, p.offset, 4).int == AUDIO_MAGIC) {
-                    val sid = ByteBuffer.wrap(p.data, p.offset + 6, 4).int
-                    if (sid != sessionId) {
-                        sessionId = sid
-                        publishInfo()
+                if (fromStationSide(p)) {
+                    if (p.length >= 10 && ByteBuffer.wrap(p.data, p.offset, 4).int == AUDIO_MAGIC) {
+                        val sid = ByteBuffer.wrap(p.data, p.offset + 6, 4).int
+                        if (sid != sessionId) {
+                            sessionId = sid
+                            publishInfo()
+                        }
                     }
+                    forward(apSender, p, guestGroupAddr, PORT)
                 }
-                forward(apSender, p, guestGroupAddr, PORT)
             }
 
             // chat both ways
             pump("SmartCastRelayChatDown", multicastReceiver(hostGroupAddr, CHAT_PORT, stationIf)) { p ->
-                forward(apSender, p, guestGroupAddr, CHAT_PORT)
+                if (fromStationSide(p)) forward(apSender, p, guestGroupAddr, CHAT_PORT)
             }
             pump("SmartCastRelayChatUp", multicastReceiver(guestGroupAddr, CHAT_PORT, apIf)) { p ->
-                forward(stationSender, p, hostGroupAddr, CHAT_PORT)
+                if (fromApSide(p)) forward(stationSender, p, hostGroupAddr, CHAT_PORT)
             }
 
             // guests -> host: heartbeats and poll answers
             pump("SmartCastRelayTelemetry", udpReceiver(TELEMETRY_PORT)) { p ->
                 val isVote = p.length >= 4 && ByteBuffer.wrap(p.data, p.offset, 4).int == PollCodec.VOTE_MAGIC
                 if (!isVote) {
-                    HeartbeatPacket.fromBytes(p.data, p.length)?.let {
-                        guestSeen[it.clientId] = System.currentTimeMillis()
-                    }
+                    val hb = HeartbeatPacket.fromBytes(p.data, p.length)
+                    if (hb != null) guestSeen[hb.clientId] = System.currentTimeMillis()
                 }
                 forward(toHost, p, hostAddr, TELEMETRY_PORT)
             }
@@ -221,7 +233,7 @@ class SmartCastRelay(
                 if (p.address.hostAddress == hostIp) {
                     val guest = handClients[msg.clientId] ?: return@pump
                     forward(toGuests, p, guest, HAND_PORT)
-                } else {
+                } else if (fromApSide(p)) {
                     handClients[msg.clientId] = p.address
                     forward(toHost, p, hostAddr, HAND_PORT)
                 }
@@ -251,6 +263,18 @@ class SmartCastRelay(
         onInfo(Info(ssid, password, relayIp, sessionId))
     }
 
+    /** True when the packet came from the host's Wi-Fi side (not from a hotspot guest, not from this phone). */
+    private fun fromStationSide(p: DatagramPacket): Boolean {
+        val src = p.address.hostAddress ?: return false
+        return src != stationIp && src.substringBeforeLast('.') != apPrefix
+    }
+
+    /** True when the packet came from a hotspot guest (not from this phone). */
+    private fun fromApSide(p: DatagramPacket): Boolean {
+        val src = p.address.hostAddress ?: return false
+        return src != apIp && src.substringBeforeLast('.') == apPrefix
+    }
+
     private fun pump(name: String, sock: DatagramSocket, onPacket: (DatagramPacket) -> Unit) {
         thread(name = name, isDaemon = true) {
             val buf = ByteArray(BUF)
@@ -268,11 +292,18 @@ class SmartCastRelay(
         sock.send(DatagramPacket(p.data, p.offset, p.length, to, port))
     }
 
-    /** Bound to the group address itself, so it only ever sees that one group's traffic. */
+    /** Tries to bind to the group address (only that group's traffic); falls back to the port alone. */
     private fun multicastReceiver(group: InetAddress, port: Int, nif: NetworkInterface): MulticastSocket {
-        val s = MulticastSocket(null)
+        var s = MulticastSocket(null)
         s.reuseAddress = true
-        s.bind(InetSocketAddress(group, port))
+        try {
+            s.bind(InetSocketAddress(group, port))
+        } catch (_: Exception) {
+            try { s.close() } catch (_: Exception) {}
+            s = MulticastSocket(null)
+            s.reuseAddress = true
+            s.bind(InetSocketAddress(port))
+        }
         s.setNetworkInterface(nif)
         s.joinGroup(InetSocketAddress(group, 0), nif)
         sockets.add(s)
@@ -287,21 +318,32 @@ class SmartCastRelay(
         return s
     }
 
-    /** station = the interface on the host's Wi-Fi range; ap = the other Wi-Fi-type interface (the hotspot). */
-    private fun findInterfaces(): Pair<Pair<NetworkInterface, Inet4Address>, Pair<NetworkInterface, Inet4Address>>? {
+    private fun wifiLikeName(n: String): Boolean =
+        n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("softap")
+
+    private fun prefixOf(a: Inet4Address): String = (a.hostAddress ?: "").substringBeforeLast('.')
+
+    /**
+     * station = the interface Android says is connected to the host's Wi-Fi (or, failing that,
+     * the one on the host's address range); ap = the other Wi-Fi-type interface (the hotspot).
+     */
+    private fun findInterfaces(stationName: String?): Pair<Pair<NetworkInterface, Inet4Address>, Pair<NetworkInterface, Inet4Address>>? {
         val all = NetworkInterface.getNetworkInterfaces() ?: return null
-        val candidates = mutableListOf<Pair<NetworkInterface, Inet4Address>>()
+        val withIp = mutableListOf<Pair<NetworkInterface, Inet4Address>>()
         for (nif in all) {
             if (!nif.isUp || nif.isLoopback) continue
-            val n = nif.name
-            if (!(n.startsWith("wlan") || n.startsWith("ap") || n.startsWith("swlan") || n.startsWith("softap"))) continue
             val addr = nif.inetAddresses.toList().firstOrNull { it is Inet4Address } as? Inet4Address ?: continue
-            candidates.add(Pair(nif, addr))
+            withIp.add(Pair(nif, addr))
         }
+        val wifiLike = withIp.filter { wifiLikeName(it.first.name) }
         val hostPrefix = hostIp.substringBeforeLast('.')
-        val sameNet = candidates.filter { (it.second.hostAddress ?: "").substringBeforeLast('.') == hostPrefix }
-        val station = sameNet.firstOrNull { it.first.name == "wlan0" } ?: sameNet.firstOrNull() ?: return null
-        val ap = candidates.firstOrNull { it.first.name != station.first.name } ?: return null
+        val byName = if (stationName != null) withIp.firstOrNull { it.first.name == stationName } else null
+        val sameNet = wifiLike.filter { prefixOf(it.second) == hostPrefix }
+        val station = byName
+            ?: sameNet.firstOrNull { it.first.name == "wlan0" }
+            ?: sameNet.firstOrNull()
+            ?: return null
+        val ap = wifiLike.firstOrNull { it.first.name != station.first.name } ?: return null
         return Pair(station, ap)
     }
 
@@ -321,6 +363,16 @@ class SmartCastRelay(
             cm.allNetworks.firstOrNull { n ->
                 cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
             }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun wifiInterfaceName(net: Network?): String? {
+        if (net == null) return null
+        return try {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.getLinkProperties(net)?.interfaceName
         } catch (_: Exception) {
             null
         }
