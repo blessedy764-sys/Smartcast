@@ -1,4 +1,4 @@
-package com.smartcast.live.qa
+package com.smartcast.live
 
 import android.Manifest
 import android.app.Activity
@@ -55,6 +55,7 @@ import com.smartcast.live.service.SmartCastAudioService
 import com.smartcast.live.telemetry.DeviceHealthMonitor
 import com.smartcast.live.telemetry.HeartbeatPacket
 import com.smartcast.live.telemetry.HeartbeatSender
+import cn.enaium.rnnoise.createRnnoise
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
@@ -391,7 +392,7 @@ class MainActivity : Activity() {
             setTextColor(0xFF536579.toInt())
         })
         details = TextView(this).apply {
-            text = "LAN multicast: one group per room (239.10.x.y), port $PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames"
+            text = "LAN multicast: one group per room (239.10.x.y), port $PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames, RNNoise noise suppression on the host mic"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF64748B.toInt())
             setPadding(0, 20, 0, 0)
@@ -1117,6 +1118,7 @@ class MainActivity : Activity() {
         thread(name = "SmartCastOpusHost") {
             var input: AudioRecord? = null
             var udp: MulticastSocket? = null
+            var denoiser: AutoCloseable? = null
             try {
                 acquireMulticastLock()
                 val key = keyFor(pin)
@@ -1141,6 +1143,11 @@ class MainActivity : Activity() {
                 // so the receiver's jitter buffer can recover a single lost packet.
                 encoder.setUseInbandFEC(true)
                 encoder.setPacketLossPercent(10)
+                // RNNoise works on 10 ms frames (480 samples at 48 kHz), so each 20 ms frame is processed in two halves.
+                val dn = createRnnoise()
+                denoiser = dn
+                val rnIn = FloatArray(dn.frameSize)
+                val rnOut = FloatArray(dn.frameSize)
                 var currentBitrate = BITRATE
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
@@ -1164,6 +1171,15 @@ class MainActivity : Activity() {
                         if (count > 0) filled += count
                     }
                     if (!running.get()) break
+                    // RNNoise: clean the host microphone before guest voice and soundboard are mixed in
+                    for (h in 0 until FRAME_SAMPLES / dn.frameSize) {
+                        val base = h * dn.frameSize
+                        for (i in 0 until dn.frameSize) rnIn[i] = pcm[base + i] / 32768f
+                        dn.processFrame(rnIn, rnOut)
+                        for (i in 0 until dn.frameSize) {
+                            pcm[base + i] = (rnOut[i] * 32767f).coerceIn(-32768f, 32767f).toInt().toShort()
+                        }
+                    }
                     // mix the approved guest's voice into the broadcast (jitter buffer: wait for 3 frames)
                     if (!guestPrimed && guestFrames.size >= 3) guestPrimed = true
                     if (guestPrimed) {
@@ -1209,6 +1225,7 @@ class MainActivity : Activity() {
                 running.set(false)
             } finally {
                 try { input?.stop() } catch (_: Exception) {}
+                try { denoiser?.close() } catch (_: Exception) {}
                 AudioEffectsManager.releaseEffects()
                 try { input?.release() } catch (_: Exception) {}
                 try { udp?.close() } catch (_: Exception) {}
