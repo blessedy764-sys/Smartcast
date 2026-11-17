@@ -3,6 +3,7 @@ package com.smartcast.live
 import com.smartcast.live.qa.HandRaiseAction
 import com.smartcast.live.qa.HandRaisePacket
 import com.smartcast.live.qa.PushToTalkController
+import com.smartcast.live.relay.SmartCastRelay
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
@@ -100,6 +101,7 @@ class MainActivity : Activity() {
         private const val VERSION: Byte = 1
         private const val MAX_OPUS_BYTES = 1275
         private const val REQUEST_MIC = 41
+        private const val REQUEST_RELAY = 42
         private const val REQUEST_PAD_BASE = 200 // 200..203 = soundboard pad file pickers
         private const val FLAG_ENCRYPTED = 1
         private const val PTT_CHANNEL: Byte = 1
@@ -182,6 +184,13 @@ class MainActivity : Activity() {
     // audio routing (wired / Bluetooth / LE Audio / hearing aid / speaker)
     private lateinit var routes: AudioRouteManager
     private lateinit var routeView: TextView
+
+    // relay / range extender (bridge node)
+    private var relay: SmartCastRelay? = null
+    @Volatile private var relayScanPending = false
+    private lateinit var relayInfoView: TextView
+    private lateinit var relayWifiQr: ImageView
+    private lateinit var relayJoinQr: ImageView
 
     // unique join QR: each broadcast gets a fresh random session ID that goes into the QR code
     @Volatile private var hostSessionId = 0
@@ -295,6 +304,33 @@ class MainActivity : Activity() {
         page.addView(button("Find rooms / switch room") { findSessions() })
         sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(sessionsBox)
+
+        // ---- Relay / range extender ----
+        page.addView(section("RANGE EXTENDER (RELAY)"))
+        page.addView(TextView(this).apply {
+            text = "Place this phone halfway between the host and far-away guests. It stays on the host's Wi-Fi and opens its own hotspot that passes the session on."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF64748B.toInt())
+        })
+        page.addView(button("Start relay (scan host's QR)") { startRelayFlow() })
+        relayInfoView = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFF12345A.toInt())
+            setPadding(0, 8, 0, 4)
+        }
+        page.addView(relayInfoView)
+        relayWifiQr = ImageView(this).apply {
+            visibility = View.GONE
+            adjustViewBounds = true
+            setPadding(0, 8, 0, 8)
+        }
+        page.addView(relayWifiQr)
+        relayJoinQr = ImageView(this).apply {
+            visibility = View.GONE
+            adjustViewBounds = true
+            setPadding(0, 8, 0, 8)
+        }
+        page.addView(relayJoinQr)
 
         // ---- Room: participants + hand raise ----
         page.addView(section("ROOM"))
@@ -1448,6 +1484,7 @@ class MainActivity : Activity() {
         refreshRoomUi()
         runOnUiThread { qrImage.visibility = View.GONE }
         advertiser.stop()
+        stopRelay()
         stopFindingSessions()
         resetHostPoll()
         resetGuestPoll()
@@ -1605,7 +1642,15 @@ class MainActivity : Activity() {
         val result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
         if (result != null) {
             val text = result.contents
-            if (text == null) toast("Scan cancelled.") else handleScannedQr(text)
+            if (text == null) {
+                relayScanPending = false
+                toast("Scan cancelled.")
+            } else if (relayScanPending) {
+                relayScanPending = false
+                startRelayFromQr(text)
+            } else {
+                handleScannedQr(text)
+            }
             return
         }
         @Suppress("DEPRECATION")
@@ -1630,6 +1675,95 @@ class MainActivity : Activity() {
         val name = (uri.getQueryParameter("room") ?: "SmartCast Session").take(40)
         val pinProtected = uri.getQueryParameter("pin") == "1"
         joinRoom(name, host, pinProtected, sid) // enter the PIN first if the room has one
+    }
+
+    // ---------- relay / range extender ----------
+
+    private fun relayPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
+        else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+    /** Relay: ask for the hotspot permission, then scan the host's QR code. */
+    private fun startRelayFlow() {
+        if (running.get()) { toast("Stop the current session first."); return }
+        val missing = relayPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), REQUEST_RELAY)
+            toast("Allow the permission, then tap Start relay again.")
+            return
+        }
+        relayScanPending = true
+        scanJoinQr()
+    }
+
+    private fun startRelayFromQr(text: String) {
+        val uri = try { Uri.parse(text) } catch (_: Exception) { null }
+        if (uri == null || uri.scheme != "smartcast" || uri.host != "join") {
+            toast("That is not a SmartCast QR code.")
+            return
+        }
+        val host = uri.getQueryParameter("host")
+        val sid = uri.getQueryParameter("sid")?.takeIf { it.length in 1..8 }?.let {
+            try { it.toLong(16).toInt() } catch (_: Exception) { null }
+        }
+        if (host == null || sid == null) {
+            toast("This QR code is incomplete or from an older version.")
+            return
+        }
+        if (running.get()) { toast("Stop the current session first."); return }
+        val name = (uri.getQueryParameter("room") ?: "SmartCast Session").take(40)
+        val pinProtected = uri.getQueryParameter("pin") == "1"
+        isHost = false
+        running.set(true)
+        setRoomLabel("Relay for: $name")
+        startAudioService(false, "Relay: $name")
+        startHealthMonitoring()
+        val r = SmartCastRelay(
+            applicationContext, host, sid,
+            onStatus = { setState(it) },
+            onInfo = { info -> runOnUiThread { showRelayInfo(info, name, pinProtected) } },
+            onFailed = { message ->
+                runOnUiThread {
+                    stopSession()
+                    setState(message)
+                }
+            }
+        )
+        relay = r
+        setState("Starting relay…")
+        r.start()
+    }
+
+    private fun qrEscape(s: String) = s
+        .replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+        .replace(":", "\\:").replace("\"", "\\\"")
+
+    /** Relay: show the hotspot Wi-Fi QR and the SmartCast join QR for guests near this phone. */
+    private fun showRelayInfo(info: SmartCastRelay.Info, room: String, pinProtected: Boolean) {
+        try {
+            val wifi = "WIFI:T:WPA;S:${qrEscape(info.ssid)};P:${qrEscape(info.password)};;"
+            relayWifiQr.setImageBitmap(qrBitmap(wifi, 600))
+            relayWifiQr.visibility = View.VISIBLE
+            val join = "smartcast://join?v=2&host=${info.relayIp}&port=$PORT&room=${Uri.encode(room)}" +
+                "&sid=${Integer.toHexString(info.sessionId)}&pin=${if (pinProtected) 1 else 0}"
+            relayJoinQr.setImageBitmap(qrBitmap(join, 600))
+            relayJoinQr.visibility = View.VISIBLE
+            relayInfoView.text = "Step 1: guests join the Wi-Fi \"${info.ssid}\" (first QR, or type the password: ${info.password}).\n" +
+                "Step 2: guests open SmartCast and tap Scan QR code to join, then scan the second QR."
+        } catch (e: Exception) {
+            toast("Could not create the relay QR codes.")
+        }
+    }
+
+    private fun stopRelay() {
+        relay?.stop()
+        relay = null
+        relayScanPending = false
+        runOnUiThread {
+            relayWifiQr.visibility = View.GONE
+            relayJoinQr.visibility = View.GONE
+            relayInfoView.text = ""
+        }
     }
 
     override fun onDestroy() {
