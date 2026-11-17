@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
@@ -32,6 +33,7 @@ import android.widget.Toast
 import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
 import com.smartcast.live.audio.AudioJitterBuffer
+import com.smartcast.live.audio.AudioRouteManager
 import com.smartcast.live.chat.ChatCodec
 import com.smartcast.live.chat.ChatMessage
 import com.smartcast.live.chat.LiveChatView
@@ -151,6 +153,10 @@ class MainActivity : Activity() {
     private lateinit var roomNameInput: EditText
     private lateinit var roomView: TextView
 
+    // audio routing (wired / Bluetooth / LE Audio / hearing aid / speaker)
+    private lateinit var routes: AudioRouteManager
+    private lateinit var routeView: TextView
+
     // unique join QR: each broadcast gets a fresh random session ID that goes into the QR code
     @Volatile private var hostSessionId = 0
     @Volatile private var hostRoomName = "SmartCast Session"
@@ -161,6 +167,9 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         buildUi()
+        routes = AudioRouteManager(this) { label -> routeView.text = label }
+        routes.startMonitoring()
+        SmartCastAudioService.onStopRequested = { runOnUiThread { stopSession() } }
         requestNeededPermissions()
     }
 
@@ -173,6 +182,11 @@ class MainActivity : Activity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             wanted += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            wanted += Manifest.permission.BLUETOOTH_CONNECT
         }
         if (wanted.isNotEmpty()) requestPermissions(wanted.toTypedArray(), REQUEST_MIC)
     }
@@ -207,6 +221,13 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, 12)
         }
         page.addView(roomView)
+        routeView = TextView(this).apply {
+            text = "Audio: -"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFF536579.toInt())
+            setPadding(0, 0, 0, 12)
+        }
+        page.addView(routeView)
         banner = TextView(this).apply {
             visibility = View.GONE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -655,6 +676,7 @@ class MainActivity : Activity() {
         pttController = PushToTalkController(host, PTT_PORT, myClientId, sender) { message ->
             setState("Talk error: $message")
         }.also { it.startTransmitting() }
+        routes.enterCommunication() // headset mic while talking
         track?.setVolume(0f) // do not play my own voice back to me with a delay
         setState("Talking to everyone…")
     }
@@ -663,6 +685,7 @@ class MainActivity : Activity() {
         if (pttController == null) return
         pttController?.stopTransmitting()
         pttController = null
+        routes.leaveCommunication() // back to the high-quality media route
         track?.setVolume(1f)
         if (running.get() && !isHost) setState("Receiving and decoding Opus audio")
     }
@@ -681,14 +704,24 @@ class MainActivity : Activity() {
                     SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
                 if (minBuffer <= 0) throw IllegalStateException("AudioTrack does not support 48 kHz output on this device")
-                val out = AudioTrack(
-                    AudioManager.STREAM_MUSIC,
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    maxOf(minBuffer, FRAME_SAMPLES * 2 * 4),
-                    AudioTrack.MODE_STREAM
-                )
+                // Voice-communication usage so the guest's voice follows the host's communication device.
+                val out = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(SAMPLE_RATE)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(maxOf(minBuffer, FRAME_SAMPLES * 2 * 4))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
                 sink = out
                 out.play()
                 val decoder = OpusDecoder(SAMPLE_RATE, 1)
@@ -740,15 +773,19 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Keeps the app alive with the screen off (foreground service + notification). */
-    private fun startAudioService(hosting: Boolean) {
+    /**
+     * Keeps the app audio-eligible with the screen off (typed foreground service + media notification).
+     * Always call this from a visible screen (a button tap) so the service gets while-in-use capabilities.
+     */
+    private fun startAudioService(hosting: Boolean, room: String) {
         try {
             startForegroundService(
                 Intent(this, SmartCastAudioService::class.java)
                     .putExtra(SmartCastAudioService.EXTRA_HOST, hosting)
+                    .putExtra(SmartCastAudioService.EXTRA_ROOM, room)
             )
-        } catch (_: Exception) {
-            // Continue without background protection rather than blocking audio.
+        } catch (e: Exception) {
+            setState("Background audio unavailable: ${e.message ?: "unknown"}")
         }
     }
 
@@ -777,7 +814,7 @@ class MainActivity : Activity() {
         activeSpeaker = null
         guestFrames.clear()
         running.set(true)
-        startAudioService(true)
+        startAudioService(true, roomName)
         startHealthMonitoring()
         startHostListeners()
         startHandListener()
@@ -821,6 +858,7 @@ class MainActivity : Activity() {
                 udp = sock
                 sock.timeToLive = 1
                 socket = sock
+                routes.enterCommunication() // pick headset / speaker route before the mic opens
                 mic.startRecording()
                 AudioEffectsManager.attachEffects(mic.audioSessionId)
                 setState(if (key == null) "Broadcasting Opus audio over local Wi-Fi" else "Broadcasting encrypted audio (PIN room)")
@@ -883,6 +921,7 @@ class MainActivity : Activity() {
                 try { udp?.close() } catch (_: Exception) {}
                 recorder = null
                 socket = null
+                routes.leaveCommunication()
                 releaseMulticastLock()
             }
         }
@@ -905,7 +944,7 @@ class MainActivity : Activity() {
         handStatus = "Hand raise: tap to ask to speak"
         updateHandUi()
         running.set(true)
-        startAudioService(false)
+        startAudioService(false, roomName)
         startHealthMonitoring()
         startHandListener()
         startChat(pin)
@@ -1055,6 +1094,7 @@ class MainActivity : Activity() {
         running.set(false)
         isHost = false
         stopTalking()
+        routes.leaveCommunication()
         stopHealthMonitoring()
         if (!keepBanner) hideBanner()
         uiHandler.removeCallbacks(refreshTick)
@@ -1265,6 +1305,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         stopSession()
+        routes.stopMonitoring()
+        SmartCastAudioService.onStopRequested = null
         super.onDestroy()
     }
 }
