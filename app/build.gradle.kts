@@ -24,6 +24,16 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Package these native libraries as they are, so Gradle stops warning that it can't strip them.
+    packaging {
+        jniLibs {
+            keepDebugSymbols += setOf(
+                "**/libandroidx.graphics.path.so",
+                "**/librnnoise_jni.so"
+            )
+        }
+    }
 }
 
 kotlin {
