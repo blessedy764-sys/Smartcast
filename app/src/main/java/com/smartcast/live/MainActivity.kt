@@ -12,6 +12,8 @@ import android.media.MediaRecorder
 import android.media.AudioManager
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -34,11 +36,13 @@ import android.util.TypedValue
 import com.smartcast.live.audio.AudioEffectsManager
 import com.smartcast.live.audio.AudioJitterBuffer
 import com.smartcast.live.audio.AudioRouteManager
+import com.smartcast.live.audio.Soundboard
 import com.smartcast.live.chat.ChatCodec
 import com.smartcast.live.chat.ChatMessage
 import com.smartcast.live.chat.LiveChatView
 import com.smartcast.live.discovery.SmartCastAdvertiser
 import com.smartcast.live.discovery.SmartCastDiscovery
+import com.smartcast.live.network.PollCodec
 import com.smartcast.live.network.PttReceiver
 import com.smartcast.live.network.PttSender
 import com.google.zxing.BarcodeFormat
@@ -68,6 +72,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.spec.SecretKeySpec
@@ -78,7 +83,7 @@ class MainActivity : Activity() {
     companion object {
         private const val GROUP = "239.10.10.10"
         private const val PORT = 50005
-        private const val TELEMETRY_PORT = 50006 // guests -> host heartbeats
+        private const val TELEMETRY_PORT = 50006 // guests -> host heartbeats and poll answers
         private const val HAND_PORT = 50007      // hand raise requests and replies
         private const val PTT_PORT = 50008       // approved guest voice -> host
         private const val CHAT_PORT = 50009      // live chat + reactions (multicast, everyone <-> everyone)
@@ -91,6 +96,7 @@ class MainActivity : Activity() {
         private const val VERSION: Byte = 1
         private const val MAX_OPUS_BYTES = 1275
         private const val REQUEST_MIC = 41
+        private const val REQUEST_PAD_BASE = 200 // 200..203 = soundboard pad file pickers
         private const val FLAG_ENCRYPTED = 1
         private const val PTT_CHANNEL: Byte = 1
         private val ROOM_SALT = "SmartCastRoomSalt-v1".toByteArray()
@@ -147,6 +153,22 @@ class MainActivity : Activity() {
     private lateinit var chatView: LiveChatView
     @Volatile private var chatSocket: MulticastSocket? = null
     @Volatile private var chatKey: SecretKeySpec? = null
+
+    // live polls (host sends on the room's multicast group; answers come back on the telemetry port)
+    private data class VoteRecord(val choice: Int, val seq: Int)
+    private val netExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var hostPoll: PollCodec.Poll? = null        // host: the current poll
+    private val pollVotes = ConcurrentHashMap<Long, VoteRecord>() // host: clientId -> latest answer
+    private var guestPoll: PollCodec.Poll? = null                 // guest: poll shown on the card (UI thread)
+    private var guestChoice = -1
+    private var guestVoteSeq = 0
+    private var lastClosedPollId: Int? = null
+    private lateinit var pollQuestionInput: EditText
+    private lateinit var pollTally: TextView
+    private lateinit var pollCard: LinearLayout
+
+    // soundboard
+    private val soundboard by lazy { Soundboard(applicationContext) }
 
     // multi-room: every host broadcasts on its own multicast group, so rooms never mix
     @Volatile private var roomGroup = GROUP
@@ -301,10 +323,60 @@ class MainActivity : Activity() {
         requestsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(requestsBox)
 
-        // ---- Live chat ----
+        // ---- Live chat (the poll card pops up above the chat stream) ----
         page.addView(section("LIVE CHAT"))
+        pollCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(24, 20, 24, 20)
+            background = GradientDrawable().apply {
+                setColor(0xFFFFFFFF.toInt())
+                cornerRadius = 24f
+                setStroke(3, 0xFF12345A.toInt())
+            }
+        }
+        page.addView(pollCard)
         chatView = LiveChatView(this).apply { onSend = { text, reaction -> sendChat(text, reaction) } }
         page.addView(chatView)
+
+        // ---- Host: live poll ----
+        page.addView(section("LIVE POLL (HOST)"))
+        pollQuestionInput = EditText(this).apply {
+            hint = "Question, e.g. Did everyone hear the deadline?"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        page.addView(pollQuestionInput)
+        page.addView(button("Send Yes / No") { startPoll(listOf("Yes", "No")) })
+        page.addView(button("Send A / B / C / D") { startPoll(listOf("A", "B", "C", "D")) })
+        page.addView(button("Close poll") { closePoll() })
+        pollTally = TextView(this).apply {
+            text = "No poll yet"
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFF12345A.toInt())
+            setPadding(0, 12, 0, 4)
+        }
+        page.addView(pollTally)
+
+        // ---- Host: soundboard ----
+        page.addView(section("SOUNDBOARD (HOST)"))
+        val padRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (i in 0 until Soundboard.PAD_COUNT) {
+            padRow.addView(Button(this).apply {
+                text = Soundboard.PAD_NAMES[i]
+                isAllCaps = false
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setOnClickListener { triggerPad(i) }
+                setOnLongClickListener { pickPadFile(i); true }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        }
+        page.addView(padRow)
+        page.addView(TextView(this).apply {
+            text = "Tap a pad to play it to everyone. Long-press a pad to load your own 16-bit .wav file."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF64748B.toInt())
+        })
 
         page.addView(section("SMARTCAST INTERPRETER"))
         page.addView(TextView(this).apply {
@@ -445,6 +517,11 @@ class MainActivity : Activity() {
                 while (running.get()) {
                     val p = DatagramPacket(buf, buf.size)
                     s.receive(p)
+                    // poll answers share this port with heartbeats; their first 4 bytes tell them apart
+                    if (p.length >= 4 && ByteBuffer.wrap(p.data, p.offset, 4).int == PollCodec.VOTE_MAGIC) {
+                        PollCodec.decodeVote(p.data, p.length, chatKey)?.let { onVote(it) }
+                        continue
+                    }
                     val hb = HeartbeatPacket.fromBytes(p.data, p.length) ?: continue
                     tracker.onHeartbeat(hb.clientId.toString(), p.address.hostAddress ?: "")
                 }
@@ -657,6 +734,217 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- live polls ----------
+
+    /** Host: announce a poll to everyone on the room's multicast group. */
+    private fun sendPoll(poll: PollCodec.Poll) {
+        val key = chatKey
+        if (hostHasPin && key == null) return // the room key is still being derived
+        val bytes = PollCodec.encodePoll(poll, key)
+        val group = roomGroup
+        netExecutor.execute {
+            try {
+                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(group), PORT))
+            } catch (_: Exception) {}
+        }
+    }
+
+    private val pollTick = object : Runnable {
+        override fun run() {
+            val poll = hostPoll
+            if (!running.get() || !isHost || poll == null || !poll.open) return
+            sendPoll(poll) // multicast is not guaranteed, so repeat so late joiners and lost packets catch up
+            uiHandler.postDelayed(this, 2000)
+        }
+    }
+
+    private fun startPoll(options: List<String>) {
+        if (!running.get() || !isHost) { toast("Start broadcasting first."); return }
+        val question = pollQuestionInput.text.toString().trim().take(80)
+        if (question.isEmpty()) { toast("Type a question first."); return }
+        if (hostHasPin && chatKey == null) { toast("Room is still starting. Try again in a second."); return }
+        uiHandler.removeCallbacks(pollTick)
+        pollVotes.clear()
+        val poll = PollCodec.Poll(SecureRandom().nextInt(), true, question, options)
+        hostPoll = poll
+        sendPoll(poll)
+        uiHandler.postDelayed(pollTick, 2000)
+        refreshPollTally()
+    }
+
+    private fun closePoll() {
+        val poll = hostPoll
+        if (poll == null || !poll.open) { toast("No poll is open."); return }
+        uiHandler.removeCallbacks(pollTick)
+        val closed = poll.copy(open = false)
+        hostPoll = closed
+        sendPoll(closed) // the close notice is repeated because multicast can drop packets
+        uiHandler.postDelayed({ sendPoll(closed) }, 500)
+        uiHandler.postDelayed({ sendPoll(closed) }, 1200)
+        refreshPollTally()
+    }
+
+    /** Host: one answer arrived (the latest answer from each listener counts). */
+    private fun onVote(vote: PollCodec.Vote) {
+        val poll = hostPoll ?: return
+        if (!poll.open || vote.pollId != poll.id || vote.choice !in poll.options.indices) return
+        pollVotes.compute(vote.clientId) { _, old ->
+            if (old == null || vote.seq > old.seq) VoteRecord(vote.choice, vote.seq) else old
+        }
+        refreshPollTally()
+    }
+
+    private fun refreshPollTally() {
+        runOnUiThread {
+            val poll = hostPoll
+            if (poll == null) {
+                pollTally.text = "No poll yet"
+                return@runOnUiThread
+            }
+            val counts = IntArray(poll.options.size)
+            for (record in pollVotes.values) if (record.choice in counts.indices) counts[record.choice]++
+            val total = counts.sum()
+            val sb = StringBuilder()
+            sb.append(if (poll.open) "● LIVE: " else "Closed: ").append(poll.question).append('\n')
+            poll.options.forEachIndexed { i, label ->
+                val pct = if (total == 0) 0 else counts[i] * 100 / total
+                val filled = pct / 10
+                sb.append(label.padEnd(4)).append(' ')
+                    .append("█".repeat(filled)).append("░".repeat(10 - filled))
+                    .append(" ").append(pct).append("% (").append(counts[i]).append(")\n")
+            }
+            sb.append("Answered: ").append(total).append(" of ").append(tracker.count()).append(" listeners")
+            pollTally.text = sb.toString()
+        }
+    }
+
+    private fun resetHostPoll() {
+        uiHandler.removeCallbacks(pollTick)
+        hostPoll = null
+        pollVotes.clear()
+        refreshPollTally()
+    }
+
+    /** Guest: a poll packet arrived on the multicast stream. */
+    private fun onPollPacket(data: ByteArray, length: Int, key: SecretKeySpec?) {
+        val poll = PollCodec.decodePoll(data, length, key) ?: return
+        runOnUiThread { showPoll(poll) }
+    }
+
+    private fun showPoll(poll: PollCodec.Poll) {
+        if (isHost || !running.get()) return
+        if (!poll.open) {
+            val wasShowing = guestPoll?.id == poll.id
+            lastClosedPollId = poll.id
+            if (wasShowing) {
+                guestPoll = null
+                pollCard.removeAllViews()
+                pollCard.addView(TextView(this).apply {
+                    text = "Poll closed. Thanks!"
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                    setTextColor(0xFF12345A.toInt())
+                })
+                uiHandler.postDelayed({ if (guestPoll == null) pollCard.visibility = View.GONE }, 3000)
+            }
+            return
+        }
+        if (poll.id == lastClosedPollId) return // a late repeat of a poll that already ended
+        if (guestPoll?.id == poll.id) return    // the same poll announced again
+        guestPoll = poll
+        guestChoice = -1
+        renderPollCard()
+    }
+
+    private fun renderPollCard() {
+        val poll = guestPoll ?: return
+        pollCard.removeAllViews()
+        pollCard.addView(TextView(this).apply {
+            text = "📊 ${poll.question}"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(0xFF12345A.toInt())
+            setPadding(0, 0, 0, 8)
+        })
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        poll.options.forEachIndexed { i, label ->
+            row.addView(Button(this).apply {
+                text = if (i == guestChoice) "✓ $label" else label
+                isAllCaps = false
+                setOnClickListener { castVote(poll, i) }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        }
+        pollCard.addView(row)
+        if (guestChoice >= 0) {
+            pollCard.addView(TextView(this).apply {
+                text = "Answer sent. Tap another option to change it."
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFF64748B.toInt())
+            })
+        }
+        pollCard.visibility = View.VISIBLE
+    }
+
+    private fun castVote(poll: PollCodec.Poll, choice: Int) {
+        val host = hostAddress
+        if (host == null) { toast("Waiting for the host..."); return }
+        guestChoice = choice
+        renderPollCard()
+        val bytes = PollCodec.encodeVote(PollCodec.Vote(poll.id, myClientId, choice, ++guestVoteSeq), guestKey)
+        thread(name = "SmartCastVote") {
+            // sent three times in case a UDP packet is lost; the host keeps only the newest answer
+            repeat(3) {
+                try {
+                    DatagramSocket().use {
+                        it.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(host), TELEMETRY_PORT))
+                    }
+                } catch (_: Exception) {}
+                try { Thread.sleep(250) } catch (_: InterruptedException) {}
+            }
+        }
+    }
+
+    private fun resetGuestPoll() {
+        guestPoll = null
+        guestChoice = -1
+        lastClosedPollId = null
+        runOnUiThread {
+            pollCard.removeAllViews()
+            pollCard.visibility = View.GONE
+        }
+    }
+
+    // ---------- soundboard ----------
+
+    private fun triggerPad(index: Int) {
+        if (!running.get() || !isHost) { toast("Start broadcasting first."); return }
+        soundboard.trigger(index)
+    }
+
+    private fun pickPadFile(index: Int) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("audio/*")
+        try {
+            startActivityForResult(intent, REQUEST_PAD_BASE + index)
+        } catch (e: Exception) {
+            toast("No file picker available.")
+        }
+    }
+
+    private fun loadPadFile(pad: Int, uri: Uri) {
+        thread(name = "SmartCastPadLoad") {
+            val error: String? = try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IllegalStateException("Could not open that file")
+                if (bytes.size > 25_000_000) throw IllegalStateException("File too large (25 MB maximum)")
+                soundboard.install(pad, bytes)
+            } catch (e: Exception) {
+                e.message ?: "Could not load that file"
+            }
+            runOnUiThread { toast(error ?: "${Soundboard.PAD_NAMES[pad]} pad updated") }
+        }
+    }
+
     // ---------- push to talk ----------
 
     /** Guest: start sending my mic to the host while the button is held (only when approved). */
@@ -813,6 +1101,9 @@ class MainActivity : Activity() {
         activeSessionId = 0
         activeSpeaker = null
         guestFrames.clear()
+        resetHostPoll()
+        soundboard.stopAll()
+        thread(name = "SmartCastSoundboardLoad") { soundboard.preloadAll() }
         running.set(true)
         startAudioService(true, roomName)
         startHealthMonitoring()
@@ -886,6 +1177,8 @@ class MainActivity : Activity() {
                             }
                         }
                     }
+                    // mix any playing soundboard pads into the broadcast
+                    soundboard.mixInto(pcm)
                     // apply bitrate changes requested by the health monitor
                     val wanted = requestedBitrate
                     if (wanted != currentBitrate) {
@@ -941,6 +1234,7 @@ class MainActivity : Activity() {
         approved = false
         guestKey = null
         pttSender = null
+        resetGuestPoll()
         handStatus = "Hand raise: tap to ask to speak"
         updateHandUi()
         running.set(true)
@@ -956,7 +1250,7 @@ class MainActivity : Activity() {
             try {
                 acquireMulticastLock()
                 val key = keyFor(pin)
-                guestKey = key // used later to encrypt my push-to-talk voice
+                guestKey = key // used later to encrypt my push-to-talk voice and poll answers
                 val groupAddress = InetAddress.getByName(group)
                 val sock = MulticastSocket(null)
                 udp = sock
@@ -1003,6 +1297,12 @@ class MainActivity : Activity() {
                 while (running.get()) {
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
                     sock.receive(packet)
+                    // poll announcements ride on the same multicast stream as the audio
+                    if (packet.length >= 4 && ByteBuffer.wrap(packet.data, packet.offset, 4).int == PollCodec.POLL_MAGIC) {
+                        onPollPacket(packet.data, packet.length, key)
+                        if (hostAddress == null) onHostFound(packet.address.hostAddress ?: "")
+                        continue
+                    }
                     if (packet.length < HEADER_SIZE) continue
                     val header = ByteBuffer.wrap(packet.data, packet.offset, packet.length).order(ByteOrder.BIG_ENDIAN)
                     if (header.int != MAGIC) continue
@@ -1129,6 +1429,9 @@ class MainActivity : Activity() {
         runOnUiThread { qrImage.visibility = View.GONE }
         advertiser.stop()
         stopFindingSessions()
+        resetHostPoll()
+        resetGuestPoll()
+        soundboard.stopAll()
         setRoomLabel("Room: not connected")
         setState("Stopped")
     }
@@ -1273,6 +1576,12 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        // soundboard: a .wav file was picked for a pad
+        val pad = requestCode - REQUEST_PAD_BASE
+        if (pad in 0 until Soundboard.PAD_COUNT) {
+            if (resultCode == RESULT_OK) data?.data?.let { loadPadFile(pad, it) }
+            return
+        }
         val result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
         if (result != null) {
             val text = result.contents
