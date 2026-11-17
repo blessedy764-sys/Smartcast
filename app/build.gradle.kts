@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.smartcast.live"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.smartcast.live"
