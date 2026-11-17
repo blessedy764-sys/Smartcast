@@ -15,7 +15,7 @@ import android.media.session.PlaybackState
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import com.smartcast.live.qa.MainActivity
+import com.smartcast.live.MainActivity
 
 /**
  * Keeps the process audio-eligible with the screen off (Android 17 background audio hardening).
