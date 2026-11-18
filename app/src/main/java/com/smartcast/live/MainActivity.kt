@@ -94,6 +94,10 @@ class MainActivity : Activity() {
         private const val HAND_PORT = 50007      // hand raise requests and replies
         private const val PTT_PORT = 50008       // approved guest voice -> host
         private const val CHAT_PORT = 50009      // live chat + reactions (multicast, everyone <-> everyone)
+        private const val SLIDE_PORT = 50010     // live slides, lyrics, PDF pages (multicast)
+        private const val POLL_PORT = 50011      // live poll announcements (multicast)
+        @Suppress("unused")
+        private const val INTERPRETER_PORT = 50012 // reserved for the future interpreter
         private const val SAMPLE_RATE = 48_000
         private const val FRAME_SAMPLES = 960 // 20 ms at 48 kHz, mono
         private const val BITRATE = 32_000
@@ -178,12 +182,12 @@ class MainActivity : Activity() {
     // soundboard
     private val soundboard by lazy { Soundboard(applicationContext) }
 
-    // live slides, lyrics and PDF push (packets share the audio multicast port, so the relay forwards them)
+    // live slides, lyrics and PDF push (own multicast port, forwarded by the relay)
     private val slides by lazy {
         SlideController(
             this,
             send = { bytes ->
-                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(roomGroup), PORT))
+                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(roomGroup), SLIDE_PORT))
             },
             isHost = { isHost },
             isRunning = { running.get() },
@@ -465,7 +469,7 @@ class MainActivity : Activity() {
             setTextColor(0xFF536579.toInt())
         })
         details = TextView(this).apply {
-            text = "LAN multicast: one group per room (239.10.x.y), port $PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames, RNNoise noise suppression on the host mic"
+            text = "LAN multicast: one group per room (239.10.x.y). Ports: audio $PORT, chat $CHAT_PORT, slides $SLIDE_PORT, polls $POLL_PORT\nAudio: Opus, 48 kHz, mono, 32 kbps, 20 ms frames, RNNoise noise suppression on the host mic"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF64748B.toInt())
             setPadding(0, 20, 0, 0)
@@ -777,7 +781,9 @@ class MainActivity : Activity() {
         }
     }
 
+    @Synchronized
     private fun onHostFound(address: String) {
+        if (hostAddress != null) return // slides, polls and audio can all find the host; only the first counts
         hostAddress = address
         heartbeatSender?.stop()
         heartbeatSender = HeartbeatSender(
@@ -844,9 +850,35 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Guest: listen on one multicast port of the room's group (slides, polls) and pass each packet to [handler]. */
+    private fun startRoomListener(name: String, port: Int, group: String, handler: (DatagramPacket) -> Unit) {
+        thread(name = name) {
+            var sock: MulticastSocket? = null
+            try {
+                acquireMulticastLock()
+                val s = MulticastSocket(null)
+                sock = s
+                s.reuseAddress = true
+                s.bind(InetSocketAddress(port))
+                s.joinGroup(InetAddress.getByName(group))
+                auxSockets.add(s) // closed by stopSession
+                val buf = ByteArray(2048)
+                while (running.get()) {
+                    val p = DatagramPacket(buf, buf.size)
+                    s.receive(p)
+                    handler(p)
+                }
+            } catch (_: Exception) {
+            } finally {
+                try { sock?.leaveGroup(InetAddress.getByName(group)) } catch (_: Exception) {}
+                try { sock?.close() } catch (_: Exception) {}
+            }
+        }
+    }
+
     // ---------- live polls ----------
 
-    /** Host: announce a poll to everyone on the room's multicast group. */
+    /** Host: announce a poll to everyone on the room's multicast group (own port, so audio is never touched). */
     private fun sendPoll(poll: PollCodec.Poll) {
         val key = chatKey
         if (hostHasPin && key == null) return // the room key is still being derived
@@ -854,7 +886,7 @@ class MainActivity : Activity() {
         val group = roomGroup
         netExecutor.execute {
             try {
-                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(group), PORT))
+                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(group), POLL_PORT))
             } catch (_: Exception) {}
         }
     }
@@ -935,7 +967,7 @@ class MainActivity : Activity() {
         refreshPollTally()
     }
 
-    /** Guest: a poll packet arrived on the multicast stream. */
+    /** Guest: a poll packet arrived on the poll port. */
     private fun onPollPacket(data: ByteArray, length: Int, key: SecretKeySpec?) {
         val poll = PollCodec.decodePoll(data, length, key) ?: return
         runOnUiThread { showPoll(poll) }
@@ -1162,6 +1194,7 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------
 
+    @Synchronized
     private fun acquireMulticastLock() {
         if (multicastLock?.isHeld == true) return
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -1226,6 +1259,7 @@ class MainActivity : Activity() {
         uiHandler.post(refreshTick)
         setState(if (pin.isEmpty()) "Starting Opus broadcaster…" else "Starting encrypted broadcaster…")
         thread(name = "SmartCastOpusHost") {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             var input: AudioRecord? = null
             var udp: MulticastSocket? = null
             var denoiser: AutoCloseable? = null
@@ -1386,6 +1420,17 @@ class MainActivity : Activity() {
         startHealthMonitoring()
         startHandListener()
         startChat(pin)
+        // slides and polls have their own ports, so they never compete with the audio loop below
+        val roomKey = lazy { keyFor(pin) }
+        startRoomListener("SmartCastSlideListener", SLIDE_PORT, group) { p ->
+            if (slides.onPacket(p.data, p.offset, p.length) && hostAddress == null) {
+                onHostFound(p.address.hostAddress ?: "")
+            }
+        }
+        startRoomListener("SmartCastPollListener", POLL_PORT, group) { p ->
+            onPollPacket(p.data, p.length, roomKey.value)
+            if (hostAddress == null) onHostFound(p.address.hostAddress ?: "")
+        }
         setState("Searching for Opus broadcast…")
         thread(name = "SmartCastOpusReceiver") {
             var udp: MulticastSocket? = null
@@ -1430,6 +1475,7 @@ class MainActivity : Activity() {
                 // Playout thread: decodes one 20 ms frame at a time from the jitter buffer.
                 // sink.write blocks, which paces this loop to real time.
                 playout = thread(name = "SmartCastPlayout") {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
                     try {
                         while (running.get()) {
                             val n = jitter.popAndDecode(decoder, pcmOut, FRAME_SAMPLES)
@@ -1441,17 +1487,6 @@ class MainActivity : Activity() {
                 while (running.get()) {
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
                     sock.receive(packet)
-                    // slide packets share the audio port; they carry their own magic number
-                    if (slides.onPacket(packet.data, packet.offset, packet.length)) {
-                        if (hostAddress == null) onHostFound(packet.address.hostAddress ?: "")
-                        continue
-                    }
-                    // poll announcements ride on the same multicast stream as the audio
-                    if (packet.length >= 4 && ByteBuffer.wrap(packet.data, packet.offset, 4).int == PollCodec.POLL_MAGIC) {
-                        onPollPacket(packet.data, packet.length, key)
-                        if (hostAddress == null) onHostFound(packet.address.hostAddress ?: "")
-                        continue
-                    }
                     if (packet.length < HEADER_SIZE) continue
                     val header = ByteBuffer.wrap(packet.data, packet.offset, packet.length).order(ByteOrder.BIG_ENDIAN)
                     if (header.int != MAGIC) continue
@@ -1534,6 +1569,7 @@ class MainActivity : Activity() {
         }
     }
 
+    @Synchronized
     private fun releaseMulticastLock() {
         try { multicastLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
         multicastLock = null
