@@ -26,7 +26,7 @@ import kotlin.concurrent.thread
 
 /**
  * Bridge node: stays on the host's Wi-Fi, opens a local-only hotspot, and forwards the session between the two.
- *  - Down (host -> guests): audio, polls and chat are re-sent on the hotspot's own multicast group, untouched
+ *  - Down (host -> guests): audio, slides, polls and chat are re-sent on the hotspot's own multicast group, untouched
  *    (so PIN rooms keep working: the relay never decrypts anything).
  *  - Up (guests -> host): heartbeats, poll answers, hand raises and push-to-talk are passed to the host.
  *    Host replies to hand raises are routed back to the right guest by client ID.
@@ -48,6 +48,8 @@ class SmartCastRelay(
         private const val HAND_PORT = 50007
         private const val PTT_PORT = 50008
         private const val CHAT_PORT = 50009
+        private const val SLIDE_PORT = 50010
+        private const val POLL_PORT = 50011
         private const val AUDIO_MAGIC = 0x53434F50
         private const val BUF = 2048
     }
@@ -195,7 +197,7 @@ class SmartCastRelay(
             }
             val toGuests = DatagramSocket().also { sockets.add(it) }
 
-            // host -> guests: audio + polls (the session ID is read from the audio header for the join QR)
+            // host -> guests: audio (the session ID is read from the audio header for the join QR)
             pump("SmartCastRelayAudio", multicastReceiver(hostGroupAddr, PORT, stationIf)) { p ->
                 if (fromStationSide(p)) {
                     if (p.length >= 10 && ByteBuffer.wrap(p.data, p.offset, 4).int == AUDIO_MAGIC) {
@@ -207,6 +209,14 @@ class SmartCastRelay(
                     }
                     forward(apSender, p, guestGroupAddr, PORT)
                 }
+            }
+
+            // host -> guests: slides and polls (own ports, so they never slow the audio pump)
+            pump("SmartCastRelaySlides", multicastReceiver(hostGroupAddr, SLIDE_PORT, stationIf)) { p ->
+                if (fromStationSide(p)) forward(apSender, p, guestGroupAddr, SLIDE_PORT)
+            }
+            pump("SmartCastRelayPolls", multicastReceiver(hostGroupAddr, POLL_PORT, stationIf)) { p ->
+                if (fromStationSide(p)) forward(apSender, p, guestGroupAddr, POLL_PORT)
             }
 
             // chat both ways
