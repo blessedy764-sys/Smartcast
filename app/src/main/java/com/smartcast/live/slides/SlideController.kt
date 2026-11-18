@@ -67,8 +67,19 @@ class SlideController(
         onSlide = { onSlideReceived(it) },
         onClear = { onClearReceived() }
     )
-    private val renderExec = Executors.newSingleThreadExecutor { r -> Thread(r, "SmartCastSlideRender").apply { isDaemon = true } }
-    private val decodeExec = Executors.newSingleThreadExecutor { r -> Thread(r, "SmartCastSlideDecode").apply { isDaemon = true } }
+    // slide work runs at background priority so it can never steal CPU from the audio threads
+    private val renderExec = Executors.newSingleThreadExecutor { r ->
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            r.run()
+        }, "SmartCastSlideRender").apply { isDaemon = true }
+    }
+    private val decodeExec = Executors.newSingleThreadExecutor { r ->
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            r.run()
+        }, "SmartCastSlideDecode").apply { isDaemon = true }
+    }
     private val renderTicket = AtomicInteger(0)
     private val decodeTicket = AtomicInteger(0)
     @Volatile private var source: Source? = null
