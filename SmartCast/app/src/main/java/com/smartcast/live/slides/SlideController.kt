@@ -1,13 +1,18 @@
 package com.smartcast.live.slides
 
+import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.Dialog
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.text.InputType
 import android.util.TypedValue
 import android.view.GestureDetector
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -22,278 +27,432 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 /**
- * Live slides for SmartCast: the host picks an image, PDF or lyrics, every page turn is compressed to
- * a small WebP and pushed to all receivers, which show it right above the chat feed.
+ * Live slides, lyrics and PDF/image push.
  *
- * MainActivity only supplies the room's send function, its state, and the PIN-room crypto.
+ * - [hostPanel]: host controls (pick image/PDF, paste lyrics, Prev / Next, hide).
+ * - [slideBox]: the live slide card. Receivers see it update by itself right above the chat feed.
+ *   The host sees the same card as an "on air" preview and can swipe it to turn pages.
+ *
+ * Every page turn compresses the page to WebP (about 40 KB) and pushes it through [SlideHost].
  */
 class SlideController(
     private val activity: Activity,
-    private val send: (ByteArray) -> Unit,
+    send: (ByteArray) -> Unit,
     private val isHost: () -> Boolean,
     private val isRunning: () -> Boolean,
     private val hostHasPin: () -> Boolean,
     private val crypto: () -> Crypto?
 ) {
-    /** PIN-room helpers. The Int is the slide ID (see IV_SEQ). Null crypto means an open room. */
+    /** PIN rooms: [encrypt] / [decrypt] take the slide bytes and the slide ID (used for the nonce). */
     class Crypto(
         val encrypt: (ByteArray, Int) -> ByteArray,
         val decrypt: (ByteArray, Int) -> ByteArray?
     )
 
     companion object {
-        const val REQUEST_PICK = 210
-
-        /** Use as the second argument of MainActivity.ivFor(slideId, IV_SEQ). Audio sequences never reach -1. */
-        const val IV_SEQ = -1
+        const val IV_SEQ = 0x534C4944 // fixed "sequence" half of the GCM nonce; the slide ID is the other half
+        private const val REQUEST_PICK = 300
+        private const val MAX_PAGES = 300
     }
 
-    private class Deck(val uris: List<Uri>, val pdf: Boolean, val verses: List<String>, val total: Int)
-
-    @Volatile private var deck: Deck? = null
-    @Volatile private var page = 0
-    private val token = AtomicInteger()
-    private val worker = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "SmartCastSlides").apply { isDaemon = true }
+    private sealed class Source(val unit: String, val count: Int) {
+        class Pdf(val uri: Uri, count: Int) : Source("Page", count)
+        class Images(val uris: List<Uri>) : Source("Slide", uris.size)
+        class Lyrics(val verses: List<String>) : Source("Verse", verses.size)
     }
-    private val hostSender = SlideHost(send)
+
+    // ---------- state ----------
+    private val host = SlideHost(send)
     private val receiver = SlideReceiver(
-        onSlide = { done -> worker.execute { showDecoded(done) } },
-        onClear = { activity.runOnUiThread { hideSlide() } }
+        onSlide = { onSlideReceived(it) },
+        onClear = { onClearReceived() }
     )
+    private val renderExec = Executors.newSingleThreadExecutor { r -> Thread(r, "SmartCastSlideRender").apply { isDaemon = true } }
+    private val decodeExec = Executors.newSingleThreadExecutor { r -> Thread(r, "SmartCastSlideDecode").apply { isDaemon = true } }
+    private val renderTicket = AtomicInteger(0)
+    private val decodeTicket = AtomicInteger(0)
+    @Volatile private var source: Source? = null
+    private var pageIndex = 0
+    private var currentBitmap: Bitmap? = null
+    private var fullDialog: Dialog? = null
+    private var fullImage: ImageView? = null
 
-    // ---- views ----
-
-    /** Shown to everyone, add it right above the chat view. */
-    val slideBox = LinearLayout(activity).apply {
-        orientation = LinearLayout.VERTICAL
-        visibility = View.GONE
-        setPadding(0, 8, 0, 8)
-    }
-    private val slideLabel = TextView(activity).apply {
+    // ---------- views ----------
+    private val slideCaption = TextView(activity).apply {
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
         setTextColor(0xFF536579.toInt())
+        setPadding(0, 0, 0, 8)
     }
+
     private val slideImage = ImageView(activity).apply {
         adjustViewBounds = true
         scaleType = ImageView.ScaleType.FIT_CENTER
-        setBackgroundColor(0xFFFFFFFF.toInt())
+        maxHeight = (activity.resources.displayMetrics.heightPixels * 0.55).toInt()
+        setOnTouchListenerCompat(this)
     }
+
+    /** Live slide card. Add it right above the chat feed. */
+    val slideBox: LinearLayout = LinearLayout(activity).apply {
+        orientation = LinearLayout.VERTICAL
+        visibility = View.GONE
+        setPadding(24, 20, 24, 20)
+        background = GradientDrawable().apply {
+            setColor(0xFFFFFFFF.toInt())
+            cornerRadius = 24f
+            setStroke(3, 0xFF12345A.toInt())
+        }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = 16 }
+        addView(slideCaption)
+        addView(
+            slideImage,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+    }
+
+    private val pageLabel = TextView(activity).apply {
+        text = "No slides loaded"
+        gravity = Gravity.CENTER
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        setTextColor(0xFF12345A.toInt())
+        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f)
+    }
+
     private val lyricsInput = EditText(activity).apply {
-        hint = "Lyrics or verses (blank line between verses)"
+        hint = "Paste lyrics here. Leave a blank line between verses."
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
             InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-        minLines = 3
-        maxLines = 8
+        minLines = 4
+        gravity = Gravity.TOP or Gravity.START
     }
 
-    /** Host controls, add it to the page (for example after the soundboard). */
-    val hostPanel = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-
-    init {
-        slideBox.addView(slideLabel)
-        slideBox.addView(slideImage)
-
-        val detector = GestureDetector(activity, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onDown(e: MotionEvent) = true
-            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-                if (!isHost() || deck == null || abs(vx) < abs(vy)) return false
-                if (vx < 0) next() else prev()
-                return true
-            }
-        })
-        slideImage.setOnTouchListener { v, e ->
-            val handled = detector.onTouchEvent(e)
-            if (e.action == MotionEvent.ACTION_UP) v.performClick()
-            handled
-        }
-
-        hostPanel.addView(TextView(activity).apply {
-            text = "LIVE SLIDES (HOST)"
+    /** Host controls. Add it to the page (it is only useful while broadcasting). */
+    val hostPanel: LinearLayout = LinearLayout(activity).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(TextView(activity).apply {
+            text = "LIVE SLIDES, LYRICS & PDF (HOST)"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             setTextColor(0xFF12345A.toInt())
             setPadding(0, 24, 0, 8)
         })
-        hostPanel.addView(button("Choose image / PDF / slides") { pick() })
-        hostPanel.addView(lyricsInput)
-        hostPanel.addView(button("Send lyrics") { sendLyrics() })
-        val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(weighted("◀ Previous") { prev() })
-        row.addView(weighted("Next ▶") { next() })
-        row.addView(weighted("Clear") { clearSlide() })
-        hostPanel.addView(row)
-        hostPanel.addView(TextView(activity).apply {
-            text = "Receivers see each slide above the chat. Swipe the slide left or right, or use the buttons, to turn pages. Slides are shrunk to about 40 KB so they send fast."
+        addView(TextView(activity).apply {
+            text = "Pick images or a PDF (export PowerPoint decks to PDF), or paste lyrics. Every page turn is pushed to all receivers, above the chat. No internet needed."
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF64748B.toInt())
         })
+        addView(btn("Pick image / PDF / deck") { pickFile() })
+        addView(lyricsInput)
+        addView(btn("Send lyrics") { sendLyrics() })
+        addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(Button(activity).apply {
+                text = "◀ Prev"
+                isAllCaps = false
+                setOnClickListener { step(-1) }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(pageLabel)
+            addView(Button(activity).apply {
+                text = "Next ▶"
+                isAllCaps = false
+                setOnClickListener { step(1) }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        })
+        addView(btn("Hide slide from receivers") { hideSlide() })
     }
 
-    private fun button(label: String, action: () -> Unit) = Button(activity).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { action() }
-        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    // ---------- public API used by MainActivity ----------
+
+    /** Feed every datagram from the audio port here. Returns true if it was a slide packet. */
+    fun onPacket(data: ByteArray, offset: Int, length: Int): Boolean = receiver.onPacket(data, offset, length)
+
+    /** Returns true if the result belonged to the slide picker. */
+    fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode != REQUEST_PICK) return false
+        if (resultCode == Activity.RESULT_OK && data != null) handlePicked(data)
+        return true
     }
 
-    private fun weighted(label: String, action: () -> Unit) = Button(activity).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { action() }
-        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    /** Receiver: forget any slide when joining a room. */
+    fun resetReceiver() {
+        receiver.reset()
+        decodeTicket.incrementAndGet()
+        ui { hideBox() }
     }
 
-    private fun toast(message: String) {
-        activity.runOnUiThread { Toast.makeText(activity, message, Toast.LENGTH_SHORT).show() }
+    /** Eco mode stretches the repeat interval so slides use less bandwidth. */
+    fun setRepeatInterval(ms: Number) {
+        host.repeatMs = ms.toLong().coerceIn(1000L, 60_000L)
     }
 
-    // ---- host: choosing and turning pages ----
+    /** Session ended: tell receivers to hide the slide (if hosting) and reset everything. */
+    fun stop() {
+        renderTicket.incrementAndGet()
+        decodeTicket.incrementAndGet()
+        if (isHost() && isRunning()) host.clear() else host.stop()
+        source = null
+        pageIndex = 0
+        receiver.reset()
+        ui {
+            hideBox()
+            pageLabel.text = "No slides loaded"
+        }
+    }
 
-    private fun pick() {
-        if (!isRunning() || !isHost()) { toast("Start broadcasting first."); return }
+    // ---------- host: picking and sending ----------
+
+    private fun canBroadcast(): Boolean {
+        if (!isRunning() || !isHost()) {
+            toast("Start broadcasting first.")
+            return false
+        }
+        return true
+    }
+
+    private fun pickFile() {
+        if (!canBroadcast()) return
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
             .setType("*/*")
-            .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "application/pdf"))
+            .putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/pdf", "image/*"))
             .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         try {
-            @Suppress("DEPRECATION")
             activity.startActivityForResult(intent, REQUEST_PICK)
         } catch (_: Exception) {
             toast("No file picker available.")
         }
     }
 
-    /** Call first thing in MainActivity.onActivityResult. Returns true if it handled the result. */
-    fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
-        if (requestCode != REQUEST_PICK) return false
-        if (resultCode == Activity.RESULT_OK && data != null) loadPicked(data)
-        return true
-    }
-
-    private fun loadPicked(data: Intent) {
+    private fun handlePicked(data: Intent) {
         val uris = ArrayList<Uri>()
-        val clip = data.clipData
-        if (clip != null) {
-            for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri)
-        } else {
-            data.data?.let { uris.add(it) }
-        }
+        data.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
+        if (uris.isEmpty()) data.data?.let { uris.add(it) }
         if (uris.isEmpty()) return
-        worker.execute {
+        toast("Opening…")
+        renderExec.execute {
             val resolver = activity.contentResolver
-            val first = uris[0]
-            val isPdf = uris.size == 1 &&
-                (resolver.getType(first) == "application/pdf" || first.toString().endsWith(".pdf", true))
-            val newDeck = try {
-                if (isPdf) {
-                    val n = SlideCompressor.pdfPageCount(resolver, first)
-                    if (n > 0) Deck(uris, true, emptyList(), n) else null
+            val picked: Source? = try {
+                val pdf = uris.firstOrNull { resolver.getType(it) == "application/pdf" }
+                if (pdf != null) {
+                    val n = SlideCompressor.pdfPageCount(resolver, pdf).coerceAtMost(MAX_PAGES)
+                    if (n > 0) Source.Pdf(pdf, n) else null
                 } else {
-                    Deck(uris, false, emptyList(), uris.size)
+                    Source.Images(uris.take(MAX_PAGES))
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
                 null
             }
-            if (newDeck == null) { toast("Could not open that file."); return@execute }
-            deck = newDeck
-            show(0)
+            ui {
+                if (picked == null) {
+                    toast("Could not open that file.")
+                } else {
+                    source = picked
+                    pageIndex = 0
+                    pushPage(0)
+                }
+            }
         }
     }
 
     private fun sendLyrics() {
-        if (!isRunning() || !isHost()) { toast("Start broadcasting first."); return }
+        if (!canBroadcast()) return
         val verses = lyricsInput.text.toString().trim()
             .split(Regex("\\n\\s*\\n"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-            .take(200)
-        if (verses.isEmpty()) { toast("Type or paste some lyrics first."); return }
-        deck = Deck(emptyList(), false, verses, verses.size)
-        show(0)
-    }
-
-    private fun next() = show(page + 1)
-    private fun prev() = show(page - 1)
-
-    private fun render(d: Deck, index: Int): Bitmap? = try {
-        val resolver = activity.contentResolver
-        when {
-            d.pdf -> SlideCompressor.fromPdfPage(resolver, d.uris[0], index)
-            d.verses.isNotEmpty() -> SlideCompressor.fromText(d.verses[index])
-            else -> SlideCompressor.fromImage(resolver, d.uris[index])
+            .take(MAX_PAGES)
+        if (verses.isEmpty()) {
+            toast("Paste some lyrics first.")
+            return
         }
-    } catch (_: Exception) {
-        null
+        source = Source.Lyrics(verses)
+        pageIndex = 0
+        pushPage(0)
     }
 
-    /** Renders, compresses and broadcasts one page. Fast swipes skip the pages in between. */
-    private fun show(index: Int) {
-        val d = deck ?: return
-        if (!isRunning() || !isHost()) { toast("Start broadcasting first."); return }
-        val i = index.coerceIn(0, d.total - 1)
-        page = i
-        val mine = token.incrementAndGet()
-        worker.execute {
-            if (mine != token.get()) return@execute
-            val bmp = render(d, i)
-            if (bmp == null) { toast("Could not read that page."); return@execute }
-            if (mine != token.get()) return@execute
-            val c = crypto()
-            if (hostHasPin() && c == null) { toast("Room is still starting. Try again in a second."); return@execute }
-            val ok = hostSender.show(bmp, i, d.total, c?.encrypt)
-            activity.runOnUiThread {
-                if (ok && mine == token.get()) showImage(bmp, "Slide ${i + 1} / ${d.total} (you are showing this)")
-                else if (!ok) toast("That page is too detailed to send.")
+    private fun step(delta: Int) {
+        if (!canBroadcast()) return
+        val src = source
+        if (src == null) {
+            toast("Pick slides or send lyrics first.")
+            return
+        }
+        val next = (pageIndex + delta).coerceIn(0, src.count - 1)
+        if (next == pageIndex && currentBitmap != null) {
+            toast(if (delta > 0) "That is the last one." else "That is the first one.")
+            return
+        }
+        pageIndex = next
+        pushPage(next)
+    }
+
+    private fun hideSlide() {
+        if (!canBroadcast()) return
+        renderTicket.incrementAndGet()
+        host.clear()
+        hideBox()
+        pageLabel.text = if (source == null) "No slides loaded" else "Hidden. Tap Next or Prev to show."
+    }
+
+    private fun render(src: Source, index: Int): Bitmap? {
+        val resolver = activity.contentResolver
+        return when (src) {
+            is Source.Pdf -> SlideCompressor.fromPdfPage(resolver, src.uri, index)
+            is Source.Images -> SlideCompressor.fromImage(resolver, src.uris[index])
+            is Source.Lyrics -> SlideCompressor.fromText(src.verses[index])
+        }
+    }
+
+    /** Renders one page off the UI thread, compresses it and pushes it to every receiver. */
+    private fun pushPage(index: Int) {
+        val src = source ?: return
+        if (!canBroadcast()) return
+        if (hostHasPin() && crypto() == null) {
+            toast("Room is still starting. Try again in a second.")
+            return
+        }
+        val ticket = renderTicket.incrementAndGet() // a newer tap cancels older, still-queued pages
+        pageLabel.text = "${src.unit} ${index + 1} / ${src.count} …"
+        renderExec.execute {
+            if (ticket != renderTicket.get()) return@execute
+            val bmp = try { render(src, index) } catch (_: Throwable) { null }
+            if (ticket != renderTicket.get()) return@execute
+            if (bmp == null) {
+                ui { toast("Could not open that page.") }
+                return@execute
+            }
+            val sent = try { host.show(bmp, index, src.count, crypto()?.encrypt) } catch (_: Exception) { false }
+            ui {
+                if (ticket != renderTicket.get()) return@ui
+                if (sent) showHostPreview(bmp, index, src) else toast("That page is too detailed to send. Try a simpler one.")
             }
         }
     }
 
-    private fun clearSlide() {
-        token.incrementAndGet()
-        deck = null
-        hostSender.clear()
-        hideSlide()
-    }
-
-    // ---- receiver ----
-
-    /** Call from the receive loop with every datagram. Returns true if it was a slide packet. */
-    fun onPacket(data: ByteArray, offset: Int, length: Int): Boolean = receiver.onPacket(data, offset, length)
-
-    /** Call when a new receiver session starts. */
-    fun resetReceiver() = receiver.reset()
-
-    private fun showDecoded(done: SlideCodec.Completed) {
-        if (isHost()) return
-        val c = crypto()
-        if (done.encrypted != (c != null)) return // PIN mismatch: not for us
-        val bytes = if (done.encrypted) (c!!.decrypt(done.data, done.slideId) ?: return) else done.data
-        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
-        activity.runOnUiThread {
-            if (isRunning() && !isHost()) showImage(bmp, "Slide ${done.page + 1} / ${done.totalPages}")
-        }
-    }
-
-    // ---- shared ----
-
-    private fun showImage(bmp: Bitmap, label: String) {
-        slideImage.setImageBitmap(bmp)
-        slideLabel.text = label
+    private fun showHostPreview(bmp: Bitmap, index: Int, src: Source) {
+        setBitmap(bmp)
+        slideCaption.text = "On air: ${src.unit.lowercase()} ${index + 1} of ${src.count}. Swipe the slide or use Prev / Next."
+        pageLabel.text = "${src.unit} ${index + 1} / ${src.count}"
         slideBox.visibility = View.VISIBLE
     }
 
-    private fun hideSlide() {
-        slideImage.setImageDrawable(null)
+    // ---------- receiver ----------
+
+    private fun onSlideReceived(c: SlideCodec.Completed) {
+        if (isHost()) return
+        val ticket = decodeTicket.incrementAndGet()
+        decodeExec.execute {
+            val bytes: ByteArray? = if (c.encrypted) {
+                val cr = crypto()
+                if (cr == null) {
+                    ui { showNotice("🔒 The host's slides are locked. Enter the room PIN and rejoin.") }
+                    return@execute
+                }
+                cr.decrypt(c.data, c.slideId)
+            } else {
+                c.data
+            }
+            if (bytes == null) {
+                ui { showNotice("Wrong PIN, so the slide cannot be opened.") }
+                return@execute
+            }
+            val bmp = (try { BitmapFactory.decodeByteArray(bytes, 0, bytes.size) } catch (_: Throwable) { null }) ?: return@execute
+            if (ticket != decodeTicket.get()) return@execute
+            ui {
+                if (ticket != decodeTicket.get() || isHost()) return@ui
+                setBitmap(bmp)
+                slideCaption.text = "📑 Page ${c.page + 1} of ${c.totalPages}. Tap to enlarge."
+                slideBox.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun onClearReceived() {
+        if (isHost()) return
+        decodeTicket.incrementAndGet()
+        ui { hideBox() }
+    }
+
+    // ---------- shared view helpers ----------
+
+    private fun setBitmap(bmp: Bitmap) {
+        currentBitmap = bmp // not recycled on purpose: the GC frees it, so a dialog can never draw a recycled bitmap
+        slideImage.visibility = View.VISIBLE
+        slideImage.setImageBitmap(bmp)
+        fullImage?.setImageBitmap(bmp) // full-screen view follows the page turns too
+    }
+
+    private fun showNotice(text: String) {
+        slideImage.visibility = View.GONE
+        slideCaption.text = text
+        slideBox.visibility = View.VISIBLE
+    }
+
+    private fun hideBox() {
+        fullDialog?.dismiss()
+        currentBitmap = null
         slideBox.visibility = View.GONE
     }
 
-    /** Call first thing in MainActivity.stopSession (before sockets close, so receivers get a clear). */
-    fun stop() {
-        token.incrementAndGet()
-        if (isHost() && deck != null) hostSender.clear() else hostSender.stop()
-        deck = null
-        receiver.reset()
-        activity.runOnUiThread { hideSlide() }
+    private fun openFullscreen() {
+        val bmp = currentBitmap ?: return
+        if (fullDialog?.isShowing == true) return
+        val iv = ImageView(activity).apply {
+            setImageBitmap(bmp)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.BLACK)
+            setOnClickListener { fullDialog?.dismiss() }
+        }
+        val d = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        d.setContentView(iv)
+        d.setOnDismissListener {
+            fullDialog = null
+            fullImage = null
+        }
+        fullImage = iv
+        fullDialog = d
+        d.show()
     }
+
+    /** Tap = full screen. On the host, a horizontal swipe turns the page. */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setOnTouchListenerCompat(view: ImageView) {
+        val detector = GestureDetector(activity, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                openFullscreen()
+                return true
+            }
+
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (!isHost() || e1 == null) return false
+                val dx = e2.x - e1.x
+                val dy = e2.y - e1.y
+                if (abs(dx) > 120 && abs(velocityX) > 400 && abs(dx) > abs(dy)) {
+                    step(if (dx < 0) 1 else -1) // swipe left = next
+                    return true
+                }
+                return false
+            }
+        })
+        view.setOnTouchListener { _, event ->
+            detector.onTouchEvent(event)
+            true
+        }
+    }
+
+    private fun btn(label: String, action: () -> Unit) = Button(activity).apply {
+        text = label
+        isAllCaps = false
+        setOnClickListener { action() }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun ui(block: () -> Unit) = activity.runOnUiThread { block() }
+
+    private fun toast(message: String) = ui { Toast.makeText(activity, message, Toast.LENGTH_SHORT).show() }
 }
