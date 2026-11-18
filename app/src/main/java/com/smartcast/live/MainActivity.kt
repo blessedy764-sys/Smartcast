@@ -56,6 +56,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.smartcast.live.room.ClientTracker
 import com.smartcast.live.security.RoomSecurity
 import com.smartcast.live.service.SmartCastAudioService
+import com.smartcast.live.slides.SlideController
 import com.smartcast.live.telemetry.DeviceHealthMonitor
 import com.smartcast.live.telemetry.HeartbeatPacket
 import com.smartcast.live.telemetry.HeartbeatSender
@@ -175,6 +176,28 @@ class MainActivity : Activity() {
 
     // soundboard
     private val soundboard by lazy { Soundboard(applicationContext) }
+
+    // live slides, lyrics and PDF push (packets share the audio multicast port, so the relay forwards them)
+    private val slides by lazy {
+        SlideController(
+            this,
+            send = { bytes ->
+                socket?.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(roomGroup), PORT))
+            },
+            isHost = { isHost },
+            isRunning = { running.get() },
+            hostHasPin = { hostHasPin },
+            crypto = {
+                val key = if (isHost) chatKey else guestKey
+                key?.let { k ->
+                    SlideController.Crypto(
+                        encrypt = { d, id -> RoomSecurity.encrypt(d, k, ivFor(id, SlideController.IV_SEQ)) },
+                        decrypt = { d, id -> RoomSecurity.decrypt(d, k, ivFor(id, SlideController.IV_SEQ)) }
+                    )
+                }
+            }
+        )
+    }
 
     // multi-room: every host broadcasts on its own multicast group, so rooms never mix
     @Volatile private var roomGroup = GROUP
@@ -363,7 +386,7 @@ class MainActivity : Activity() {
         requestsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(requestsBox)
 
-        // ---- Live chat (the poll card pops up above the chat stream) ----
+        // ---- Live chat (the poll card and the slide pop up above the chat stream) ----
         page.addView(section("LIVE CHAT"))
         pollCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -376,6 +399,7 @@ class MainActivity : Activity() {
             }
         }
         page.addView(pollCard)
+        page.addView(slides.slideBox) // live slide / lyrics / PDF page, right above the chat feed
         chatView = LiveChatView(this).apply { onSend = { text, reaction -> sendChat(text, reaction) } }
         page.addView(chatView)
 
@@ -417,6 +441,9 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF64748B.toInt())
         })
+
+        // ---- Host: live slides, lyrics and PDF ----
+        page.addView(slides.hostPanel)
 
         page.addView(section("SMARTCAST INTERPRETER"))
         page.addView(TextView(this).apply {
@@ -1291,6 +1318,7 @@ class MainActivity : Activity() {
         guestKey = null
         pttSender = null
         resetGuestPoll()
+        slides.resetReceiver()
         handStatus = "Hand raise: tap to ask to speak"
         updateHandUi()
         running.set(true)
@@ -1306,7 +1334,7 @@ class MainActivity : Activity() {
             try {
                 acquireMulticastLock()
                 val key = keyFor(pin)
-                guestKey = key // used later to encrypt my push-to-talk voice and poll answers
+                guestKey = key // used later to encrypt my push-to-talk voice, poll answers and to decrypt slides
                 val groupAddress = InetAddress.getByName(group)
                 val sock = MulticastSocket(null)
                 udp = sock
@@ -1353,6 +1381,11 @@ class MainActivity : Activity() {
                 while (running.get()) {
                     val packet = DatagramPacket(receiveBuffer, receiveBuffer.size)
                     sock.receive(packet)
+                    // slide packets share the audio port; they carry their own magic number
+                    if (slides.onPacket(packet.data, packet.offset, packet.length)) {
+                        if (hostAddress == null) onHostFound(packet.address.hostAddress ?: "")
+                        continue
+                    }
                     // poll announcements ride on the same multicast stream as the audio
                     if (packet.length >= 4 && ByteBuffer.wrap(packet.data, packet.offset, 4).int == PollCodec.POLL_MAGIC) {
                         onPollPacket(packet.data, packet.length, key)
@@ -1447,6 +1480,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopSession(keepBanner: Boolean = false) {
+        slides.stop() // first, so receivers get a "clear" before the sockets close
         running.set(false)
         isHost = false
         stopTalking()
@@ -1633,6 +1667,8 @@ class MainActivity : Activity() {
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        // live slides: an image, PDF or deck was picked
+        if (slides.onActivityResult(requestCode, resultCode, data)) return
         // soundboard: a .wav file was picked for a pad
         val pad = requestCode - REQUEST_PAD_BASE
         if (pad in 0 until Soundboard.PAD_COUNT) {
