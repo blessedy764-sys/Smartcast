@@ -45,6 +45,7 @@ import com.smartcast.live.chat.ChatCodec
 import com.smartcast.live.chat.ChatMessage
 import com.smartcast.live.chat.LiveChatView
 import com.smartcast.live.discovery.SmartCastAdvertiser
+import com.smartcast.live.eco.CongestionMonitor
 import com.smartcast.live.discovery.SmartCastDiscovery
 import com.smartcast.live.network.PollCodec
 import com.smartcast.live.network.PttReceiver
@@ -199,6 +200,10 @@ class MainActivity : Activity() {
         )
     }
 
+    // eco mode: the host steps the stream down when its hotspot struggles (send failures / slow sends)
+    private val congestion = CongestionMonitor { level -> onEcoLevelChanged(level) }
+    private lateinit var ecoButton: Button
+
     // multi-room: every host broadcasts on its own multicast group, so rooms never mix
     @Volatile private var roomGroup = GROUP
     private lateinit var roomNameInput: EditText
@@ -316,6 +321,8 @@ class MainActivity : Activity() {
         page.addView(roomNameInput)
         page.addView(button("Start broadcasting") { startHost() })
         page.addView(button("Stop session") { stopSession() })
+        ecoButton = button("Eco mode: Auto") { cycleEcoMode() }
+        page.addView(ecoButton)
         page.addView(button("Show join QR code") { showJoinQr() })
         page.addView(button("Scan QR code to join") { scanJoinQr() })
         qrImage = ImageView(this).apply {
@@ -483,6 +490,42 @@ class MainActivity : Activity() {
 
     private fun setState(message: String) {
         runOnUiThread { status.text = "Status: $message" }
+    }
+
+    // ---------- eco mode (network self-healing) ----------
+
+    private fun cycleEcoMode() {
+        congestion.setMode(
+            when (congestion.mode()) {
+                CongestionMonitor.Mode.AUTO -> CongestionMonitor.Mode.ECO
+                CongestionMonitor.Mode.ECO -> CongestionMonitor.Mode.FULL
+                CongestionMonitor.Mode.FULL -> CongestionMonitor.Mode.AUTO
+            }
+        )
+        updateEcoButton()
+    }
+
+    private fun updateEcoButton() {
+        runOnUiThread {
+            ecoButton.text = when (congestion.mode()) {
+                CongestionMonitor.Mode.AUTO -> "Eco mode: Auto (${congestion.levelName()})"
+                CongestionMonitor.Mode.ECO -> "Eco mode: Always on (${congestion.levelName()})"
+                CongestionMonitor.Mode.FULL -> "Eco mode: Off (full quality)"
+            }
+        }
+    }
+
+    /** Called (from the audio thread or the UI) whenever the stream steps down or recovers. */
+    private fun onEcoLevelChanged(level: Int) {
+        slides.setRepeatInterval(congestion.slideRepeatMs())
+        updateEcoButton()
+        if (!isHost || !running.get()) return
+        val message = when (level) {
+            CongestionMonitor.LEVEL_NORMAL -> "Network recovered. Full audio quality restored."
+            CongestionMonitor.LEVEL_ECO -> "Network is busy. Eco mode on to keep everyone connected."
+            else -> "Network is very congested. Survival mode: lowest bitrate."
+        }
+        runOnUiThread { toast(message) }
     }
 
     // ---------- device health (heat + battery) ----------
@@ -1169,6 +1212,7 @@ class MainActivity : Activity() {
         activeSpeaker = null
         guestFrames.clear()
         resetHostPoll()
+        congestion.reset()
         soundboard.stopAll()
         thread(name = "SmartCastSoundboardLoad") { soundboard.preloadAll() }
         running.set(true)
@@ -1215,6 +1259,7 @@ class MainActivity : Activity() {
                 val rnIn = FloatArray(dn.frameSize)
                 val rnOut = FloatArray(dn.frameSize)
                 var currentBitrate = BITRATE
+                var currentComplexity = 5
                 val pcm = ShortArray(FRAME_SAMPLES)
                 val encoded = ByteArray(MAX_OPUS_BYTES)
                 val address = InetAddress.getByName(group)
@@ -1238,7 +1283,7 @@ class MainActivity : Activity() {
                     }
                     if (!running.get()) break
                     // RNNoise: clean the host microphone before guest voice and soundboard are mixed in
-                    for (h in 0 until FRAME_SAMPLES / dn.frameSize) {
+                    if (congestion.denoiseEnabled()) for (h in 0 until FRAME_SAMPLES / dn.frameSize) {
                         val base = h * dn.frameSize
                         for (i in 0 until dn.frameSize) rnIn[i] = pcm[base + i] / 32768f
                         dn.processFrame(rnIn, rnOut)
@@ -1262,10 +1307,15 @@ class MainActivity : Activity() {
                     // mix any playing soundboard pads into the broadcast
                     soundboard.mixInto(pcm)
                     // apply bitrate changes requested by the health monitor
-                    val wanted = requestedBitrate
+                    val wanted = minOf(requestedBitrate, congestion.bitrateCap()) // thermal and congestion limits both apply
                     if (wanted != currentBitrate) {
                         encoder.setBitrate(wanted)
                         currentBitrate = wanted
+                    }
+                    val wantedComplexity = congestion.complexity()
+                    if (wantedComplexity != currentComplexity) {
+                        encoder.setComplexity(wantedComplexity)
+                        currentComplexity = wantedComplexity
                     }
                     val encodedLength = encoder.encode(pcm, 0, FRAME_SAMPLES, encoded, 0, encoded.size)
                     if (encodedLength > 0) {
@@ -1283,7 +1333,17 @@ class MainActivity : Activity() {
                         packetData.putShort(body.size.toShort())
                         packetData.put(body)
                         val bytes = packetData.array()
-                        sock.send(DatagramPacket(bytes, bytes.size, address, PORT))
+                        // A failed or slow send is a congestion signal, not a reason to end the broadcast.
+                        val sentAt = System.nanoTime()
+                        var sendFailed = false
+                        try {
+                            sock.send(DatagramPacket(bytes, bytes.size, address, PORT))
+                        } catch (_: java.io.IOException) {
+                            sendFailed = true
+                        }
+                        congestion.onSend(System.nanoTime() - sentAt, sendFailed)
+                        // ~5 s of nothing getting through means the socket or Wi-Fi is gone, not just busy
+                        if (congestion.consecutiveFailures() > 250) throw IllegalStateException("Network unavailable")
                     }
                 }
             } catch (e: Exception) {
@@ -1522,6 +1582,7 @@ class MainActivity : Activity() {
         stopFindingSessions()
         resetHostPoll()
         resetGuestPoll()
+        congestion.reset()
         soundboard.stopAll()
         setRoomLabel("Room: not connected")
         setState("Stopped")
